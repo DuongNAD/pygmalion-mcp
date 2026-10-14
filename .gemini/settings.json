@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "charforge": {
+      "command": "/Users/duongnad/Documents/project/CharForge/.venv/bin/python",
+      "args": ["-m", "charforge"],
+      "timeout": 600000
+    }
+  }
+}

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "charforge"
+version = "0.1.0"
+description = "MCP server: character turnaround sheet -> 3D model, fully automated with a self-check loop"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.28,<2",          # also brings httpx (used by L2 providers)
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+  "scikit-image>=0.24",    # marching cubes for the L2 blockout
+  "pillow>=10",
+  "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+charforge = "charforge.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+charforge = ["bpy_scripts/*.py", "playbook.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["blender: needs a local Blender install (auto-skipped otherwise)"]
