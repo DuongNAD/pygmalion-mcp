@@ -234,25 +234,33 @@ def test_meshy_provider_multiview_and_rig_and_anim(tmp_path):
             body = json.loads(request.content.decode("utf-8"))
             assert len(body["image_urls"]) == 3
             assert body["pose_mode"] == "a-pose"
-            assert body["ai_model"] == "latest"
+            assert body["ai_model"] == config.MESHY_AI_MODEL
+            assert body["should_remesh"] is True
+            assert body["topology"] == "triangle"
             assert body["enable_pbr"] is True
-            return httpx.Response(202, json={"result": "meshy-mv-001"})
+            return httpx.Response(202, json={"result": "0193mv00-0001-4000-8000-000000000001"})
         elif request.method == "POST" and url_str.endswith("/rigging"):
             body = json.loads(request.content.decode("utf-8"))
-            assert body["input_task_id"] == "meshy-mv-001"
+            assert body["input_task_id"] == "0193mv00-0001-4000-8000-000000000001"
             assert body["height_meters"] == 1.72
-            return httpx.Response(200, json={"result": "rig_meshy-mv-001"})
+            return httpx.Response(200, json={"result": "0193rig0-0002-4000-8000-000000000002"})
         elif request.method == "POST" and url_str.endswith("/animations"):
             body = json.loads(request.content.decode("utf-8"))
-            assert body["rig_task_id"] == "rig_meshy-mv-001"
-            assert body["action_id"] == 1
-            return httpx.Response(200, json={"result": "anim_rig_001"})
-        elif request.method == "GET" and "/multi-image-to-3d/meshy-mv-001" in url_str:
+            assert body["rig_task_id"] == "0193rig0-0002-4000-8000-000000000002"
+            assert body["action_ids"] == [17, 42]
+            return httpx.Response(200, json={"result": "0193anim-0003-4000-8000-000000000003"})
+        elif request.method == "GET" and "/multi-image-to-3d/0193mv00-0001-4000-8000-000000000001" in url_str:
             return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/mv.glb"}})
-        elif request.method == "GET" and "/rigging/rig_meshy-mv-001" in url_str:
-            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rig.glb"}})
-        elif request.method == "GET" and "/animations/anim_rig_001" in url_str:
-            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/anim.glb"}})
+        elif request.method == "GET" and "/rigging/0193rig0-0002-4000-8000-000000000002" in url_str:
+            return httpx.Response(
+                200,
+                json={"status": "SUCCEEDED", "result": {"rigged_character_glb_url": "https://meshy.mock/rig.glb"}},
+            )
+        elif request.method == "GET" and "/animations/0193anim-0003-4000-8000-000000000003" in url_str:
+            return httpx.Response(
+                200,
+                json={"status": "SUCCEEDED", "result": {"animation_glb_url": "https://meshy.mock/anim.glb"}},
+            )
         return httpx.Response(404)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -266,28 +274,28 @@ def test_meshy_provider_multiview_and_rig_and_anim(tmp_path):
 
     # 1. submit_multiview
     job_id = p.submit_multiview(views, pose_mode="a-pose")
-    assert job_id == "meshy-mv-001"
-    poll_mv = p.poll(job_id)
+    assert job_id == "0193mv00-0001-4000-8000-000000000001"
+    poll_mv = p.poll(job_id, kind="multi-image-to-3d")
     assert poll_mv["status"] == "done"
     assert poll_mv["url"] == "https://meshy.mock/mv.glb"
 
     # 2. submit_rig
     rig_id = p.submit_rig(input_task_id=job_id, height_meters=1.72)
-    assert rig_id == "rig_meshy-mv-001"
+    assert rig_id == "0193rig0-0002-4000-8000-000000000002"
     poll_rig = p.poll_rig(rig_id)
     assert poll_rig["status"] == "done"
     assert poll_rig["url"] == "https://meshy.mock/rig.glb"
 
     # 3. submit_animation
-    anim_id = p.submit_animation(rig_task_id=rig_id, action_id=1)
-    assert anim_id == "anim_rig_001"
+    anim_id = p.submit_animation(rig_task_id=rig_id, action_ids=[17, 42])
+    assert anim_id == "0193anim-0003-4000-8000-000000000003"
     poll_anim = p.poll_animation(anim_id)
     assert poll_anim["status"] == "done"
     assert poll_anim["url"] == "https://meshy.mock/anim.glb"
 
-    # 4. poll dispatch via generic poll(job_id)
-    assert p.poll(rig_id)["status"] == "done"
-    assert p.poll(anim_id)["status"] == "done"
+    # 4. poll dispatch via generic poll(job_id, kind=...)
+    assert p.poll(rig_id, kind="rigging")["status"] == "done"
+    assert p.poll(anim_id, kind="animations")["status"] == "done"
 
 
 def test_tripo_provider_upload_and_multiview_mapping(tmp_path):
@@ -402,9 +410,12 @@ def test_auto_rig_prioritization(sheet_path, monkeypatch, tmp_path):
             body = json.loads(request.content.decode("utf-8"))
             assert body["input_task_id"] == "meshy-upstream-task-789"
             assert body["height_meters"] == 1.70
-            return httpx.Response(200, json={"result": "rig_meshy_task_789"})
-        elif request.method == "GET" and "/openapi/v1/rigging/rig_meshy_task_789" in url_str:
-            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rigged.glb"}})
+            return httpx.Response(200, json={"result": "0193rig0-0789-4000-8000-000000000789"})
+        elif request.method == "GET" and "/openapi/v1/rigging/0193rig0-0789-4000-8000-000000000789" in url_str:
+            return httpx.Response(
+                200,
+                json={"status": "SUCCEEDED", "result": {"rigged_character_glb_url": "https://meshy.mock/rigged.glb"}},
+            )
         elif request.method == "GET" and "meshy.mock/rigged.glb" in url_str:
             return httpx.Response(200, content=dummy_rigged_glb)
         return httpx.Response(404)
@@ -417,7 +428,8 @@ def test_auto_rig_prioritization(sheet_path, monkeypatch, tmp_path):
     res = tools_full.auto_rig(project_id=pid, mesh_path=mesh_rel, method="auto")
     assert res["ok"] is True
     assert res["data"]["method"] == "provider"
-    assert res["data"]["rig_task_id"] == "rig_meshy_task_789"
+    assert res["data"]["rig_source"] == "provider"
+    assert res["data"]["rig_task_id"] == "0193rig0-0789-4000-8000-000000000789"
     assert (pdir / res["data"]["mesh_path"]).read_bytes() == dummy_rigged_glb
 
     # 2. When method="provider" without MESHY_API_KEY, raises NO_PROVIDER
@@ -479,7 +491,10 @@ def test_generate_mesh_to_auto_rig_real_pipeline_flow(sheet_path, monkeypatch, t
             assert body["input_task_id"] == "meshy-gen-task-101"
             return httpx.Response(200, json={"result": "meshy-rig-task-202"})
         elif request.method == "GET" and "/openapi/v1/rigging/meshy-rig-task-202" in u:
-            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rigged.glb"}})
+            return httpx.Response(
+                200,
+                json={"status": "SUCCEEDED", "result": {"rigged_character_glb_url": "https://meshy.mock/rigged.glb"}},
+            )
         elif request.method == "GET" and "meshy.mock/rigged.glb" in u:
             return httpx.Response(200, content=dummy_rig_glb)
         return httpx.Response(404)

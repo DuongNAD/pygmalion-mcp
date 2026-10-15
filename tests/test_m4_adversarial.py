@@ -676,10 +676,13 @@ class TestProviderHttpErrors:
     def test_provider_poll_status_http_errors(self, setup_provider_project, monkeypatch, status_code):
         """Simulate HTTP 404 or 500 on GET /openapi/v1/animations/{task_id} polling."""
         pid, pdir = setup_provider_project
+        mock_lib = [{"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"}]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
                 return httpx.Response(200, json={"result": "anim_task_1"})
             elif request.method == "GET" and "anim_task_1" in url_str:
                 return httpx.Response(status_code, text=f"Poll error {status_code}")
@@ -699,10 +702,13 @@ class TestProviderHttpErrors:
     def test_provider_task_status_failed(self, setup_provider_project, monkeypatch):
         """Simulate Meshy animation task returning status='FAILED'."""
         pid, pdir = setup_provider_project
+        mock_lib = [{"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"}]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
                 return httpx.Response(200, json={"result": "anim_task_fail"})
             elif request.method == "GET" and "anim_task_fail" in url_str:
                 return httpx.Response(200, json={"status": "FAILED", "task_error": {"message": "Corrupted armature hierarchy"}})
@@ -722,12 +728,17 @@ class TestProviderHttpErrors:
         assert "Use method='blender'" in res["error"]["fix"]
 
     def test_provider_poll_timeout(self, setup_provider_project, monkeypatch):
-        """Simulate task remaining in 'running' state past the 60s timeout."""
+        """Simulate task remaining in 'running' state past the 55s slice (returns status='running'),
+        and past JOB_TIMEOUT_SECONDS (raises PROVIDER_TIMEOUT).
+        """
         pid, pdir = setup_provider_project
+        mock_lib = [{"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"}]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
                 return httpx.Response(200, json={"result": "anim_task_timeout"})
             elif request.method == "GET" and "anim_task_timeout" in url_str:
                 return httpx.Response(200, json={"status": "IN_PROGRESS", "progress": 25})
@@ -739,31 +750,43 @@ class TestProviderHttpErrors:
             lambda name, client=None: providers.MeshyProvider(api_key="test-meshy-key", client=client or mock_client)
         )
 
-        # Fast-forward time so we don't actually wait 60s
-        cur_time = [0.0]
+        # Fast-forward time by 30s per call so first slice returns status="running", then exceeds 1200s
+        cur_time = [1000.0]
         def mock_time():
-            cur_time[0] += 25.0
+            cur_time[0] += 30.0
             return cur_time[0]
 
         monkeypatch.setattr("time.time", mock_time)
         monkeypatch.setattr("time.sleep", lambda s: None)
 
-        res = tools_full.animate(project_id=pid, actions=["idle"], method="provider")
-        assert res["ok"] is False
-        assert res["error"]["code"] == "PROVIDER_FAILED"
-        assert "Meshy animation failed" in res["error"]["message"]
+        res_running = tools_full.animate(project_id=pid, actions=["idle"], method="provider")
+        assert res_running["ok"] is True
+        assert res_running["data"]["status"] == "running"
+        assert res_running["data"]["job_id"] == "anim_task_timeout"
+
+        # Jump past JOB_TIMEOUT_SECONDS (1200s)
+        cur_time[0] += 1500.0
+        res_timeout = tools_full.animate(project_id=pid, actions=["idle"], method="provider", job_id="anim_task_timeout")
+        assert res_timeout["ok"] is False
+        assert res_timeout["error"]["code"] == "PROVIDER_TIMEOUT"
 
     @pytest.mark.parametrize("status_code", [404, 500])
     def test_provider_cdn_download_http_errors(self, setup_provider_project, monkeypatch, status_code):
         """Simulate HTTP 404 or 500 when downloading animation clip GLB from provider CDN."""
         pid, pdir = setup_provider_project
+        mock_lib = [{"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"}]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
                 return httpx.Response(200, json={"result": "anim_task_dl"})
             elif request.method == "GET" and "anim_task_dl" in url_str:
-                return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://cdn.meshy.ai/clip1.glb"}})
+                return httpx.Response(
+                    200,
+                    json={"status": "SUCCEEDED", "result": {"animation_glb_url": "https://cdn.meshy.ai/clip1.glb"}},
+                )
             elif "cdn.meshy.ai" in url_str:
                 return httpx.Response(status_code, text=f"CDN Download Error {status_code}")
             return httpx.Response(404)
@@ -782,13 +805,19 @@ class TestProviderHttpErrors:
     def test_provider_cdn_corrupt_glb_payload(self, setup_provider_project, monkeypatch):
         """Simulate CDN returning 200 OK with non-GLB corrupt HTML text."""
         pid, pdir = setup_provider_project
+        mock_lib = [{"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"}]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
                 return httpx.Response(200, json={"result": "anim_task_corrupt"})
             elif request.method == "GET" and "anim_task_corrupt" in url_str:
-                return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://cdn.meshy.ai/corrupt.glb"}})
+                return httpx.Response(
+                    200,
+                    json={"status": "SUCCEEDED", "result": {"animation_glb_url": "https://cdn.meshy.ai/corrupt.glb"}},
+                )
             elif "cdn.meshy.ai" in url_str:
                 return httpx.Response(200, content=b"<html>502 Bad Gateway</html>")
             return httpx.Response(404)
@@ -801,27 +830,22 @@ class TestProviderHttpErrors:
 
         res = tools_full.animate(project_id=pid, actions=["idle"], method="provider")
         assert res["ok"] is False
-        # When Blender attempts to merge the corrupt GLB or inspect chunk 0, it fails with ANIM_FAILED or CFError
         assert res["error"]["code"] in ("ANIM_FAILED", "BLENDER_ERROR", "PROVIDER_FAILED")
 
     def test_provider_partial_stream_failure(self, setup_provider_project, monkeypatch):
-        """Simulate 1st clip succeeding but 2nd clip failing on submit."""
+        """Simulate library fetch succeeding but animation submission failing with HTTP 500."""
         pid, pdir = setup_provider_project
-
-        call_count = {"submit": 0}
+        mock_lib = [
+            {"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"},
+            {"action_id": 42, "name": "Walking_Woman", "key": "Walking_Woman", "category": "WalkAndRun", "sub_category": "Walking"},
+        ]
 
         def handler(request: httpx.Request) -> httpx.Response:
             url_str = str(request.url)
-            if request.method == "POST" and "animations" in url_str:
-                call_count["submit"] += 1
-                if call_count["submit"] == 1:
-                    return httpx.Response(200, json={"result": "anim_task_1"})
-                else:
-                    return httpx.Response(500, text="Meshy worker died on clip 2")
-            elif request.method == "GET" and "anim_task_1" in url_str:
-                return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://cdn.meshy.ai/clip1.glb"}})
-            elif "cdn.meshy.ai/clip1.glb" in url_str:
-                return httpx.Response(200, content=create_synthetic_glb_binary(["idle"]))
+            if request.method == "GET" and url_str.endswith("/animations/library"):
+                return httpx.Response(200, json=mock_lib)
+            elif request.method == "POST" and url_str.endswith("/animations"):
+                return httpx.Response(500, text="Meshy worker died on submit")
             return httpx.Response(404)
 
         mock_client = httpx.Client(transport=httpx.MockTransport(handler))

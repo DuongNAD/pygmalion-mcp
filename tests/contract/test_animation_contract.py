@@ -123,69 +123,73 @@ def test_animation_contract_unique_action_naming(tmp_path):
 
 
 def test_animation_provider_mode_mock_transport_flow(tmp_path):
-    """Simulate provider animation flow: download individual action GLBs and verify merge."""
-    action_clips = {
-        1: create_mock_glb_with_animations(["idle"]),
-        2: create_mock_glb_with_animations(["walk"]),
-        3: create_mock_glb_with_animations(["wave"]),
-    }
+    """Simulate real Meshy provider animation flow:
+    1. GET /openapi/v1/animations/library -> resolve non-contiguous action_ids
+    2. POST /openapi/v1/animations with {'rig_task_id': ..., 'action_ids': [...]} (1 request)
+    3. GET /openapi/v1/animations/{id} -> read result.animation_glb_url (no model_urls)
+    4. Download merged GLB and verify track names via rename_glb_animations / inspect_glb_animations.
+    """
+    from charforge import providers
+    from charforge.tools_full import rename_glb_animations
+
+    raw_provider_glb = create_mock_glb_with_animations(["Idle_Lib", "Walking_Woman_Lib", "Waving_Gesture_Lib"])
+    mock_library = [
+        {"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"},
+        {"action_id": 42, "name": "Walking_Woman", "key": "Walking_Woman", "category": "WalkAndRun", "sub_category": "Walking"},
+        {"action_id": 108, "name": "Waving_Gesture", "key": "Waving_Gesture", "category": "BodyMovements", "sub_category": "Greeting"},
+    ]
+    post_requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
-        if request.method == "POST" and "animations" in url_str:
+        if request.method == "GET" and url_str.endswith("/openapi/v1/animations/library"):
+            return httpx.Response(200, json=mock_library)
+        elif request.method == "POST" and url_str.endswith("/openapi/v1/animations"):
             body = json.loads(request.content.decode("utf-8"))
-            act_id = body.get("action_id", 1)
-            return httpx.Response(200, json={"result": f"anim_task_{act_id}"})
-        elif request.method == "GET" and "anim_task_" in url_str:
-            act_id = int(url_str.split("_")[-1])
+            post_requests.append(body)
+            assert "rig_task_id" in body
+            assert "action_ids" in body and isinstance(body["action_ids"], list)
+            assert "action_id" not in body
+            return httpx.Response(202, json={"result": "0193aaaa-bbbb-4000-8000-111122223333"})
+        elif request.method == "GET" and "/openapi/v1/animations/0193aaaa-bbbb-4000-8000-111122223333" in url_str:
             return httpx.Response(
                 200,
                 json={
+                    "id": "0193aaaa-bbbb-4000-8000-111122223333",
                     "status": "SUCCEEDED",
-                    "model_urls": {"glb": f"https://mock.cdn/anim_{act_id}.glb"},
+                    "result": {
+                        "animation_glb_url": "https://mock.cdn/anim_merged.glb",
+                        "animation_fbx_url": "https://mock.cdn/anim_merged.fbx",
+                    },
                 },
             )
-        elif request.method == "GET" and "mock.cdn/anim_" in url_str:
-            act_id = int(url_str.split("/")[-1].replace(".glb", "").replace("anim_", ""))
-            return httpx.Response(200, content=action_clips[act_id])
+        elif request.method == "GET" and "mock.cdn/anim_merged.glb" in url_str:
+            return httpx.Response(200, content=raw_provider_glb)
         return httpx.Response(404)
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
+    prov = providers.MeshyProvider(api_key="key", client=client)
 
-    # Download 3 action clips
-    downloaded_clips = []
-    for act_id in (1, 2, 3):
-        # 1. Submit
-        sub_res = client.post(
-            "https://api.meshy.ai/openapi/v1/animations",
-            headers={"Authorization": "Bearer key", "Content-Type": "application/json"},
-            json={"rig_task_id": "rig_task_123", "action_id": act_id},
-        )
-        assert sub_res.status_code == 200
-        task_id = sub_res.json()["result"]
+    lib = prov.fetch_animation_library(force_refresh=True)
+    action_ids = prov.resolve_action_ids(["idle", "walk", "wave"], library=lib)
+    assert action_ids == [17, 42, 108]
 
-        # 2. Poll
-        poll_res = client.get(
-            f"https://api.meshy.ai/openapi/v1/animations/{task_id}",
-            headers={"Authorization": "Bearer key"},
-        )
-        assert poll_res.status_code == 200
-        dl_url = poll_res.json()["model_urls"]["glb"]
+    task_id = prov.submit_animation(rig_task_id="01930000-1111-4000-8000-000000000000", action_ids=action_ids)
+    assert len(post_requests) == 1
+    assert post_requests[0]["action_ids"] == [17, 42, 108]
 
-        # 3. Download
-        dl_res = client.get(dl_url)
-        assert dl_res.status_code == 200
-        clip_path = tmp_path / f"clip_{act_id}.glb"
-        clip_path.write_bytes(dl_res.content)
-        downloaded_clips.append(clip_path)
+    # Poll using a brand new MeshyProvider instance and explicit kind='animations'
+    fresh_prov = providers.MeshyProvider(api_key="key", client=client)
+    poll_res = fresh_prov.poll(task_id, kind="animations")
+    assert poll_res["status"] == "done"
+    dl_url = poll_res["url"]
+    assert dl_url == "https://mock.cdn/anim_merged.glb"
 
-    assert len(downloaded_clips) == 3
-
-    # Merged GLB inspection simulation
-    merged_actions = ["idle", "walk", "wave"]
     merged_glb = tmp_path / "merged_character.glb"
-    merged_glb.write_bytes(create_mock_glb_with_animations(merged_actions))
+    fresh_prov.download(dl_url, merged_glb)
+    rename_glb_animations(merged_glb, ["idle", "walk", "wave"])
 
     final_clips = inspect_glb_animations(merged_glb.read_bytes())
     assert len(final_clips) == 3
     assert final_clips == ["idle", "walk", "wave"]
+

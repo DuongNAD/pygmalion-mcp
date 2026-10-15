@@ -30,4 +30,7 @@ charforge = ["bpy_scripts/*.py", "playbook.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["blender: needs a local Blender install (auto-skipped otherwise)"]
+markers = [
+  "blender: needs a local Blender install (auto-skipped otherwise)",
+  "live: calls live external cloud APIs (requires MESHY_API_KEY and CHARFORGE_LIVE=1)",
+]
