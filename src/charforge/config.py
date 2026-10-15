@@ -51,7 +51,17 @@ def level() -> int:
 
 
 def blender_exe() -> str | None:
-    for cand in (os.environ.get("BLENDER_PATH"), shutil.which("blender"), "/Applications/Blender.app/Contents/MacOS/Blender"):
+    cands = [
+        os.environ.get("BLENDER_PATH"),
+        shutil.which("blender"),
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+    ]
+    win_blender_dir = Path("C:/Program Files/Blender Foundation")
+    if win_blender_dir.is_dir():
+        found = sorted(win_blender_dir.glob("Blender */blender.exe"), reverse=True)
+        cands.extend(str(p) for p in found)
+
+    for cand in cands:
         if cand and Path(cand).is_file():
             return cand
     return None

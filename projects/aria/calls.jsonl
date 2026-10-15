@@ -1,0 +1,9 @@
+{"t": 1792063772.965, "tool": "project_create", "args": {"sheet_path": "assets/aria_turnaround.png", "name": "aria", "height_cm": 165}, "ok": true, "code": null, "sec": 0.0}
+{"t": 1792063773.112, "tool": "sheet_split", "args": {"project_id": "aria"}, "ok": true, "code": null, "sec": 0.14}
+{"t": 1792063773.351, "tool": "generate_mesh", "args": {"project_id": "aria", "provider": "auto"}, "ok": true, "code": null, "sec": 0.23}
+{"t": 1792063774.436, "tool": "score_mesh", "args": {"project_id": "aria", "mesh_path": "meshes/cand-1-blockout.ply"}, "ok": true, "code": null, "sec": 1.07}
+{"t": 1792063776.931, "tool": "mesh_optimize", "args": {"project_id": "aria", "mesh_path": "meshes/cand-1-blockout.ply"}, "ok": true, "code": null, "sec": 2.49}
+{"t": 1792063777.801, "tool": "mesh_export", "args": {"project_id": "aria", "mesh_path": "meshes/cand-1-blockout-opt.glb", "format": "glb"}, "ok": true, "code": null, "sec": 0.85}
+{"t": 1792063779.416, "tool": "auto_rig", "args": {"project_id": "aria", "mesh_path": "export/aria.glb"}, "ok": true, "code": null, "sec": 1.61}
+{"t": 1792063780.628, "tool": "animate", "args": {"project_id": "aria", "mesh_path": "export/aria-rigged.glb"}, "ok": true, "code": null, "sec": 1.21}
+{"t": 1792063780.634, "tool": "pipeline_run", "args": {"project_id": "aria", "max_seconds": 300, "rig": true, "animate": true}, "ok": true, "code": null, "sec": 7.67}

@@ -9,7 +9,10 @@ import sys
 from pathlib import Path
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 

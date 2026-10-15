@@ -48,7 +48,41 @@ def iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.logical_and(a, b).sum() / union) if union else 0.0
 
 
-def width_profile(canon: np.ndarray, bins: int = config.PROFILE_BINS) -> list[float]:
+def extract_torso_core(canon: np.ndarray) -> np.ndarray:
+    """Extract torso core silhouette (|x - 256| <= 0.22 * height) so arm extensions do not corrupt torso width profile."""
+    ys = np.nonzero(canon.any(axis=1))[0]
+    if ys.size == 0:
+        return np.zeros_like(canon, dtype=bool)
+    top, bottom = ys.min(), ys.max() + 1
+    height = max(1, bottom - top)
+    max_dx = 0.22 * height
+    x_indices = np.arange(canon.shape[1])
+    core_cols = np.abs(x_indices - (canon.shape[1] // 2)) <= max_dx
+    core = np.zeros_like(canon, dtype=bool)
+    core[:, core_cols] = canon[:, core_cols]
+    return core
+
+
+torso_core_mask = extract_torso_core
+
+
+def arm_span_ratio(canon: np.ndarray) -> float:
+    """Maximum horizontal width ratio in the arm band (18% - 65% from top)."""
+    ys, xs = np.nonzero(canon)
+    if ys.size == 0:
+        return 0.0
+    h = max(1, ys.max() - ys.min() + 1)
+    y_top = ys.min()
+    y_start = int(y_top + 0.18 * h)
+    y_end = int(y_top + 0.65 * h)
+    arm_band = canon[y_start:y_end, :]
+    ys_a, xs_a = np.nonzero(arm_band)
+    if xs_a.size == 0:
+        return 0.0
+    return float((xs_a.max() - xs_a.min() + 1) / h)
+
+
+def width_profile(canon: np.ndarray, bins: int = config.PROFILE_BINS, torso_only: bool = False) -> list[float]:
     """Filled width per horizontal band (top -> bottom) as a fraction of the figure height."""
     ys = np.nonzero(canon.any(axis=1))[0]
     if ys.size == 0:
@@ -56,7 +90,8 @@ def width_profile(canon: np.ndarray, bins: int = config.PROFILE_BINS) -> list[fl
     top, bottom = ys.min(), ys.max() + 1
     edges = np.linspace(top, bottom, bins + 1).astype(int)
     height = bottom - top
-    return [float(canon[a:max(b, a + 1)].any(axis=0).sum() / height) for a, b in zip(edges[:-1], edges[1:])]
+    mask = extract_torso_core(canon) if torso_only else canon
+    return [float(mask[a:max(b, a + 1)].any(axis=0).sum() / height) for a, b in zip(edges[:-1], edges[1:])]
 
 
 def contact_sheet(rows: list[list[Path | str]], out: Path, height: int = 384) -> Path:

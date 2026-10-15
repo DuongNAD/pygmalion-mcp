@@ -4,12 +4,18 @@ Registered into FastMCP server when CHARFORGE_LEVEL >= 2.
 """
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import Annotated, Literal
 
+logger = logging.getLogger("charforge.fit")
+
 import numpy as np
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -68,8 +74,9 @@ def generate_mesh(
             rpath = f"meshes/cand-{n_cands}-{prov_name}.glb"
             dst = pdir / rpath
             prov.download(res["url"], dst)
-            state.register_mesh(p, rpath, source=prov_name, seed=job_info.get("seed", seed))
+            state.register_mesh(p, rpath, source=prov_name, seed=job_info.get("seed", seed), task_id=job_id)
             job_info["status"] = "done"
+            job_info["mesh_path"] = rpath
             state.save(p)
             return ok(
                 {"status": "done", "job_id": job_id, "provider": prov_name, "mesh_path": rpath, "seconds": round(time.time() - t0, 2)},
@@ -119,8 +126,9 @@ def generate_mesh(
         rpath = f"meshes/cand-{n_cands}-{chosen}.glb"
         dst = pdir / rpath
         prov.download(poll_res["url"], dst)
-        state.register_mesh(p, rpath, source=chosen, seed=seed)
+        state.register_mesh(p, rpath, source=chosen, seed=seed, task_id=new_job_id)
         p["jobs"][new_job_id]["status"] = "done"
+        p["jobs"][new_job_id]["mesh_path"] = rpath
         state.save(p)
         return ok(
             {"status": "done", "job_id": new_job_id, "provider": chosen, "mesh_path": rpath, "seconds": round(time.time() - t0, 2)},
@@ -161,8 +169,20 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
 
     c_ref_f = score.canonical_mask(score.load_mask(front_ref_mask))
     c_ren_f = score.canonical_mask(score.load_mask(front_ren_mask))
-    prof_ref_f = score.width_profile(c_ref_f)
-    prof_ren_f = score.width_profile(c_ren_f)
+
+    # Check if reference and candidate mesh arm poses differ
+    span_ref = score.arm_span_ratio(c_ref_f)
+    span_ren = score.arm_span_ratio(c_ren_f)
+    arm_poses_differ = bool(
+        abs(span_ref - span_ren) > 0.15 and (span_ref > 0.50 or span_ren > 0.50)
+    )
+
+    if arm_poses_differ:
+        prof_ref_f = score.width_profile(c_ref_f, torso_only=True)
+        prof_ren_f = score.width_profile(c_ren_f, torso_only=True)
+    else:
+        prof_ref_f = score.width_profile(c_ref_f)
+        prof_ren_f = score.width_profile(c_ren_f)
 
     c_ref_s = score.canonical_mask(score.load_mask(side_ref_mask))
     side_m = score.load_mask(side_ren_mask)
@@ -208,6 +228,11 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
     scale_x = _smooth(scale_x)
     scale_y = _smooth(scale_y)
 
+    if arm_poses_differ:
+        # Damp horizontal lattice scaling on arm height bands (w in 7..13)
+        for w in range(7, 14):
+            scale_x[w] = 1.0 + (scale_x[w] - 1.0) * 0.20
+
     # 5. Output path and fit execution
     stem = Path(rpath).stem
     fit_count = sum(1 for m in p["meshes"] if f"{stem}-fit" in m["path"]) + 1
@@ -221,20 +246,45 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
         "rotate_z": last_score.get("rotate_z", 0),
         "scale_x": ",".join(f"{x:.4f}" for x in scale_x),
         "scale_y": ",".join(f"{y:.4f}" for y in scale_y),
+        "damp_arms": arm_poses_differ,
     }
     blender.run("fit.py", args)
 
-    state.register_mesh(p, out_rpath, source="fit")
-    state.save(p)
+    # 6. Monotonicity guard: verify fit improved silhouette score
+    out_render = state.render_dir(p, out_rpath)
+    r_ren = blender.run("render_views.py", {"mesh": out_path, "out": out_render, "mode": "mask", "rotate_z": last_score.get("rotate_z", 0)})
+    ref_masks = {v: score.load_mask(pdir / p["views"][v]["mask"]) for v in state.VIEWS}
+    ren_masks = {v: score.load_mask(r_ren["files"][v]) for v in state.VIEWS}
+    res_fit = score.compare(ref_masks, ren_masks, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15))
+
+    score_before = float(last_score.get("total", 0.0))
+    score_after = float(res_fit.get("total", 0.0))
+    warnings = []
+
+    if score_after < score_before:
+        warn_msg = f"Lattice fit degraded silhouette IoU from {score_before:.3f} to {score_after:.3f}; retaining original candidate."
+        logger.warning(warn_msg)
+        warnings.append(warn_msg)
+        chosen_rpath = rpath
+        state.record_score(p, {**last_score, "mesh": rpath})
+        state.save(p)
+        nxt = state.suggest_next(p)
+    else:
+        chosen_rpath = out_rpath
+        state.register_mesh(p, out_rpath, source="fit")
+        state.record_score(p, {"mesh": out_rpath, "rotate_z": last_score.get("rotate_z", 0), "tris": r_ren["tris"], **res_fit})
+        state.save(p)
+        nxt = action("score_mesh", "Score the fitted mesh.", project_id=project_id, mesh_path=out_rpath)
 
     return ok(
         {
-            "mesh_path": out_rpath,
+            "mesh_path": chosen_rpath,
             "scale_x": [round(x, 4) for x in scale_x],
             "scale_y": [round(y, 4) for y in scale_y],
         },
         project_id,
-        action("score_mesh", "Score the fitted mesh.", project_id=project_id, mesh_path=out_rpath),
+        nxt,
+        warnings=warnings,
     )
 
 

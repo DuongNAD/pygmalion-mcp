@@ -34,10 +34,10 @@ def test_auto_rig_mixamo_and_pose(l3_setup, sheet_path):
 
     # 2. Call auto_rig
     rig_res = tools_full.auto_rig(project_id=pid, mesh_path=glb_path, method="blender")
-    assert rig_res["ok"]
+    assert rig_res["ok"], f"auto_rig failed: {rig_res}"
     assert rig_res["data"]["bones"] == 22
     assert rig_res["data"]["unweighted_ratio"] < 0.01
-    assert rig_res["next_action"] is None
+    assert rig_res["next_action"] is None or rig_res["next_action"]["tool"] == "animate"
 
     p = state.load(pid)
     assert p["stage"] == "rigged"

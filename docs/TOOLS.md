@@ -6,10 +6,9 @@ Annotation: `project_status` là read-only. Các tool khác chỉ ghi trong `pro
 
 | Level | Tool | Trạng thái |
 |---|---|---|
-| L1 | project_create, project_status, render_views | chạy được |
-| L1 | sheet_split, score_mesh | đã nối dây, còn chờ stub `sheet.py` (L1-T1/T2) và `score.compare`/`write_diffs` (L1-T3) |
-| L2 | generate_mesh, mesh_fit, mesh_optimize, mesh_export | mới có spec, sẽ nằm trong `tools_core.py` |
-| L3 | auto_rig, pipeline_run | mới có spec, sẽ nằm trong `tools_full.py` |
+| L1 | project_create, project_status, render_views, sheet_split, score_mesh | Đã hoàn thành & kiểm thử |
+| L2 | generate_mesh, mesh_fit, mesh_optimize, mesh_export | Đã hoàn thành & kiểm thử |
+| L3 | auto_rig, animate, pipeline_run | Đã hoàn thành & kiểm thử |
 
 ---
 ## L1: phần "mắt" (tách sheet, render, chấm điểm)
@@ -64,12 +63,27 @@ Annotation: `project_status` là read-only. Các tool khác chỉ ghi trong `pro
 ## L3: hoàn thiện
 
 ### auto_rig(project_id, mesh_path, method="auto"|"blender"|"provider")
-- `blender`: `bpy_scripts/rig.py` dựng armature khoảng 22 xương, đặt tên kiểu Mixamo (Hips, Spine…, LeftArm, LeftUpLeg…). Vị trí khớp lấy từ bbox và `reference` (neck_ratio, profile). Parent bằng automatic weights; lỗi bone heat thì chuyển sang envelope weights.
-- `provider`: dùng API rig của Tripo/Meshy nếu có key. `auto`: có key thì dùng provider, không thì `blender`.
-- Tự kiểm tra: xoay LeftArm 45°, mesh phải biến dạng và tỷ lệ vertex không có weight < 1%. Xuất `export/<id>-rigged.glb`.
-- data: `{mesh_path, bones, unweighted_ratio}` · next: null · lỗi: `RIG_FAILED`
+- `blender`: `bpy_scripts/rig.py` dựng armature khoảng 22 xương, đặt tên kiểu Mixamo (Hips, Spine…, LeftArm, LeftUpLeg…). Vị trí khớp xác định bằng geometry/medial-axis centroids (sai số <= 8 cm trên cả T-pose, A-pose, arms-down). Pre-bind seam welding, bắt lỗi bone heat failure, hai tầng fallback weighting (geodesic BFS + bilateral IDW) ngăn chặn rò rỉ trọng số tay sang đùi.
+- `provider`: gọi API rigging của Meshy (`POST /openapi/v1/rigging`) nếu có API key và `task_id` hợp lệ. `auto`: ưu tiên provider khi có key và task, ngược lại fallback sang Blender.
+- Tự kiểm tra: xoay `LeftArm` 40° kiểm tra biến dạng tay (> 10 cm) và rò rỉ đùi/thân dưới (< 0.5 cm). Xuất `export/<id>-rigged.glb`.
+- data: `{mesh_path: "export/<id>-rigged.glb", bones: 22, unweighted_ratio: float}` · next: L3 → `animate` · lỗi: `NO_PROVIDER`, `RIG_FAILED`
 
-### pipeline_run(project_id, max_seconds=240, rig=true)
+### animate(project_id, mesh_path=None, actions=None, method="auto"|"blender"|"provider")
+- `project_id`: ID của project (ví dụ: 'aria').
+- `mesh_path`: đường dẫn tương đối tới rigged GLB (mặc định lấy `outputs.rigged` từ `auto_rig`).
+- `actions`: danh sách animation actions cần tạo hoặc ghép (mặc định: `["idle", "walk", "wave"]`). Nếu trùng tên sẽ tự động deduplicate (ví dụ `walk` → `walk`, `walk_01`).
+- `method`: `"auto"|"blender"|"provider"`. Mặc định `"auto"`: nếu có `MESHY_API_KEY` và `rig_task_id` thì dùng `"provider"`, ngược lại dùng `"blender"`.
+- `provider`: gọi Meshy `POST /openapi/v1/animations` theo từng action, tải các clip GLB riêng lẻ và dùng Blender headless hợp nhất thành file GLB duy nhất với `export_animation_mode='ACTIONS'`.
+- `blender`: sinh keyframe chuyển động procedural trực tiếp trên 22 xương Mixamo trong Blender headless:
+  * `idle`: 60 frame (30 fps), nhịp thở dịch chuyển trục Z trên xương Hips (±1.2 cm) kèm lắc nhẹ Spine/Neck.
+  * `walk`: 40 frame, chu kỳ bước chân luân phiên đối xứng cho chân và vung cánh tay ngược pha.
+  * `wave`: 60 frame, nâng cánh tay phải và vẫy cẳng tay/bàn tay theo chu kỳ hình sin.
+- Tự kiểm tra: đọc trực tiếp chunk 0 JSON của file GLB xuất ra để xác minh số lượng và tên clip khớp chính xác với yêu cầu.
+- data: `{mesh_path: "export/<id>-animated.glb", actions: ["idle", "walk", "wave"], clip_count: int, method: str}` · next: `null` (hoàn tất quy trình) · lỗi: `NO_RIGGED_MESH`, `ANIM_FAILED`, `PROVIDER_FAILED`
+
+### pipeline_run(project_id, max_seconds=240, rig=true, animate=false)
 - `max_seconds`: 60–540. Gọi lần lượt các hàm của tool L1–L3 theo đúng policy §6 cho đến khi hết thời gian, rồi lưu trạng thái và trả về.
+- `rig`: boolean (mặc định True), tự động chạy `auto_rig` sau `mesh_export`.
+- `animate`: boolean (mặc định False), tự động chạy `animate` sau `auto_rig` đưa project về trạng thái `animated`.
 - data: `{status: running|done|blocked, stage, steps: [{tool, ok, summary}], best, outputs}`
-- next: running → `pipeline_run(project_id)`; blocked → đúng tool và args cần agent làm (ví dụ `sheet_split(assign=…)`); done → null
+- next: running → `pipeline_run(project_id, rig=…, animate=…)`; blocked → đúng tool và args cần agent làm (ví dụ `sheet_split(assign=…)`); done → null

@@ -38,7 +38,23 @@ def _canonical_rgb(img: np.ndarray, mask: np.ndarray, size: int = config.CANON_S
     top, left = size - int(0.03 * size) - nh, size // 2 - cx
     x0, x1 = max(0, left), min(size, left + nw)
     out[top:top + nh, x0:x1] = crop_resized[:, x0 - left:x1 - left]
+
+    # Dilate interior foreground colors outward into background so 3D boundary vertices
+    # never sample white background halos.
+    fg = np.zeros((size, size), dtype=bool)
+    fg[top:top + nh, x0:x1] = mask_resized[:, x0 - left:x1 - left]
+    if fg.any() and not fg.all():
+        fg_inner = cv2.erode(fg.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+        cur_fg = fg_inner if fg_inner.any() else fg
+        kernel = np.ones((5, 5), np.uint8)
+        for _ in range(8):
+            dil_rgb = cv2.dilate(np.where(cur_fg[:, :, None], out, 0), kernel, iterations=1)
+            dil_mask = cv2.dilate(cur_fg.astype(np.uint8), kernel, iterations=1).astype(bool)
+            new_px = dil_mask & ~cur_fg
+            out[new_px] = dil_rgb[new_px]
+            cur_fg = dil_mask
     return out
+
 
 
 def _resolve_path(base_dir: Path, p: Any) -> Path:
@@ -97,17 +113,29 @@ def blockout(views: dict[str, Any], reference: dict, height_cm: float, dst: Path
     elif side_faces == "left":
         flip_side = False
     else:
-        # Check protrusion in the head band (top 8-22%)
         y_min_s, y_max_s = ys_s.min(), ys_s.max()
         h_s = y_max_s - y_min_s + 1
-        head_mask = side_canon[y_min_s:y_min_s + int(round(0.22 * h_s)), :]
-        h_ys, h_xs = np.nonzero(head_mask)
-        if h_xs.size > 0:
-            left_ext = 256 - h_xs.min()
-            right_ext = h_xs.max() - 256
-            flip_side = bool((right_ext - left_ext) > 4)
+        shin_xs = np.nonzero(side_canon[y_min_s + int(round(0.82 * h_s)):y_min_s + int(round(0.90 * h_s)), :])[1]
+        foot_xs = np.nonzero(side_canon[y_min_s + int(round(0.92 * h_s)):y_max_s + 1, :])[1]
+        if shin_xs.size > 0 and foot_xs.size > 0:
+            shin_c = float(np.median(shin_xs))
+            left_toe = shin_c - float(foot_xs.min())
+            right_toe = float(foot_xs.max()) - shin_c
         else:
-            flip_side = False
+            left_toe = right_toe = 0.0
+
+        if abs(right_toe - left_toe) > 4.0:
+            flip_side = bool(right_toe > left_toe)
+        else:
+            # Fallback: check protrusion in the head band (top 8-22%)
+            head_mask = side_canon[y_min_s:y_min_s + int(round(0.22 * h_s)), :]
+            h_ys, h_xs = np.nonzero(head_mask)
+            if h_xs.size > 0:
+                left_ext = 256 - h_xs.min()
+                right_ext = h_xs.max() - 256
+                flip_side = bool((right_ext - left_ext) > 4)
+            else:
+                flip_side = False
 
     side_facing_left = np.fliplr(side_canon) if flip_side else side_canon
     back_mirrored = np.fliplr(canon_masks["back"])
@@ -125,19 +153,23 @@ def blockout(views: dict[str, Any], reference: dict, height_cm: float, dst: Path
     y_bottom = int(ys_fb.max())
     h_canon = max(1, y_bottom - y_top + 1)
 
-    Nz = 192
-    k_min, k_max = 2, Nz - 3
-    s_v = h_canon / (k_max - k_min)
-
     w_front = int(xs_fb.max() - xs_fb.min() + 1)
     w_side = int(xs_s.max() - xs_s.min() + 1)
 
-    Nx = max(96, int(round(w_front / s_v)) + 8)
-    Ny = max(64, int(round(w_side / s_v)) + 8)
+    D_max = max(h_canon, w_front, w_side)
+    s_v = max(D_max / 187.0, 1.0)
+
+    Nx = min(224, max(48, int(round(w_front / s_v)) + 8))
+    Ny = min(224, max(48, int(round(w_side / s_v)) + 8))
+    Nz = min(224, max(48, int(round(h_canon / s_v)) + 8))
     if Nx % 2 != 0:
         Nx += 1
     if Ny % 2 != 0:
         Ny += 1
+    if Nz % 2 != 0:
+        Nz += 1
+
+    k_min, k_max = 2, Nz - 3
 
     rows = np.clip(np.round(y_bottom - (np.arange(Nz) - k_min) * s_v).astype(int), 0, config.CANON_SIZE - 1)
     cols_x = np.clip(np.round(256 + (np.arange(Nx) - (Nx - 1) / 2.0) * s_v).astype(int), 0, config.CANON_SIZE - 1)
@@ -151,15 +183,99 @@ def blockout(views: dict[str, Any], reference: dict, height_cm: float, dst: Path
     mask_yz = side_facing_left[rows[:, None], cols_y[None, :]]  # (Nz, Ny)
     mask_yz[~valid_z, :] = False
 
-    # 3D visual hull voxels: shape (Nx, Ny, Nz)
-    voxels = mask_xz.T[:, None, :] & mask_yz.T[None, :, :]
+    # 3D visual hull voxels: shape (Nx, Ny, Nz) with elliptical cross-sections,
+    # round lateral arm depth bounding, and sagittal centering for detached side features.
+    def _runs_1d(arr: np.ndarray) -> list[tuple[int, int]]:
+        padded = np.empty(len(arr) + 2, dtype=bool)
+        padded[0] = False
+        padded[1:-1] = arr
+        padded[-1] = False
+        diffs = np.flatnonzero(padded[1:] != padded[:-1])
+        return list(zip(diffs[0::2].tolist(), (diffs[1::2] - 1).tolist()))
+
+    voxels = np.zeros((Nx, Ny, Nz), dtype=np.uint8)
+    torso_x_bounds = np.zeros((Nz, 2), dtype=np.float32)
+    torso_x_bounds[:, 1] = float(Nx - 1)
+    mid_x = (Nx - 1) / 2.0
+    mid_y = (Ny - 1) / 2.0
+    xs_grid = np.arange(Nx, dtype=np.float32)[:, None]
+    ys_grid = np.arange(Ny, dtype=np.float32)[None, :]
+
+    # Reference sagittal torso center and upper-cranium back bound (to separate attached ponytails)
+    torso_ys = np.nonzero(mask_yz[int(0.20 * Nz):int(0.72 * Nz), :])[1]
+    body_y_center = float(np.median(torso_ys)) if torso_ys.size > 0 else mid_y
+
+    cranium_ys = np.nonzero(mask_yz[int(0.91 * Nz):int(0.97 * Nz), :])[1]
+    head_y_back = int(np.percentile(cranium_ys, 95)) if cranium_ys.size > 0 else Ny - 1
+    has_detached_back = any(
+        len(_runs_1d(mask_yz[kk])) > 1 for kk in range(int(0.74 * Nz), int(0.90 * Nz))
+    )
+
+    for k in range(k_min, k_max + 1):
+        x_runs = _runs_1d(mask_xz[k])
+        y_runs = _runs_1d(mask_yz[k])
+        if not x_runs or not y_runs:
+            continue
+
+        # If a posterior hair/ponytail bridge merges with the cranium in upper-head slices, split at head_y_back
+        if has_detached_back and k >= int(0.80 * Nz) and len(y_runs) == 1:
+            y0_m, y1_m = y_runs[0]
+            if y0_m < head_y_back < y1_m - 3:
+                y_runs = [(y0_m, head_y_back), (head_y_back, y1_m)]
+
+        main_y_run = min(y_runs, key=lambda r: abs(0.5 * (r[0] + r[1]) - body_y_center))
+        main_x_run = min(x_runs, key=lambda r: abs(0.5 * (r[0] + r[1]) - mid_x))
+
+        if len(x_runs) >= 3:
+            core_x_runs = set(x_runs[1:-1])
+            torso_x_bounds[k, 0] = float(x_runs[1][0])
+            torso_x_bounds[k, 1] = float(x_runs[-2][1])
+        elif len(x_runs) == 2 and k > int(0.48 * Nz) and main_x_run[0] <= mid_x <= main_x_run[1]:
+            core_x_runs = {main_x_run}
+            torso_x_bounds[k, 0] = float(main_x_run[0])
+            torso_x_bounds[k, 1] = float(main_x_run[1])
+        else:
+            core_x_runs = set(x_runs)
+
+        for x0, x1 in x_runs:
+            is_lat_arm = (x0, x1) not in core_x_runs
+            for y0, y1 in y_runs:
+                is_sec_y = len(y_runs) > 1 and (y0, y1) != main_y_run
+                if is_sec_y and is_lat_arm:
+                    continue
+
+                cx = 0.5 * (x0 + x1)
+                cy = 0.5 * (y0 + y1)
+                rx = 0.5 * (x1 - x0)
+                ry = 0.5 * (y1 - y0)
+
+                if is_sec_y:
+                    rx = min(rx, 1.25 * ry + 1.5)
+                if is_lat_arm:
+                    ry = min(ry, 1.15 * rx + 1.5)
+
+                ix0 = max(x0, int(np.floor(cx - rx)))
+                ix1 = min(x1, int(np.ceil(cx + rx)))
+                iy0 = max(y0, int(np.floor(cy - ry)))
+                iy1 = min(y1, int(np.ceil(cy + ry)))
+
+                if rx < 1.5 or ry < 1.5:
+                    voxels[ix0:ix1 + 1, iy0:iy1 + 1, k] = 1
+                else:
+                    dx = (xs_grid[ix0:ix1 + 1] - cx) / (rx + 0.65)
+                    dy = (ys_grid[:, iy0:iy1 + 1] - cy) / (ry + 0.65)
+                    voxels[ix0:ix1 + 1, iy0:iy1 + 1, k] |= (dx * dx + dy * dy <= 1.05).astype(np.uint8)
+
+    if not np.any(voxels):
+        voxels = (mask_xz.T[:, None, :] & mask_yz.T[None, :, :]).astype(np.uint8)
     if not np.any(voxels):
         raise CFError("BLOCKOUT_FAILED", "Visual hull intersection is empty.", "Check view alignments.")
 
-    # 5. Marching Cubes surface extraction
-    verts, faces, normals, _ = marching_cubes(voxels.astype(float), level=0.5)
+    # 5. Marching Cubes surface extraction (orient faces outward so normals point out of the volume)
+    verts, faces, normals, _ = marching_cubes(voxels, level=0.5)
+    faces = faces[:, [0, 2, 1]]
 
-    # 6. Laplacian smoothing (10 passes, lambda=0.5)
+    # 6. Taubin volume-preserving smoothing (10 alternating passes: lambda=0.50, mu=-0.52)
     edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
     edges = np.sort(edges, axis=1)
     edges = np.unique(edges, axis=0)
@@ -169,13 +285,14 @@ def blockout(views: dict[str, Any], reference: dict, height_cm: float, dst: Path
     np.add.at(deg, edges[:, 1], 1)
     deg[deg == 0] = 1
 
-    for _ in range(10):
+    for step in range(10):
+        weight = 0.50 if (step % 2 == 0) else -0.52
         sum_neighbors = np.zeros_like(verts)
         np.add.at(sum_neighbors, edges[:, 0], verts[edges[:, 1]])
         np.add.at(sum_neighbors, edges[:, 1], verts[edges[:, 0]])
-        verts += 0.5 * (sum_neighbors / deg[:, None] - verts)
+        verts += weight * (sum_neighbors / deg[:, None] - verts)
 
-    # 7. Recompute vertex normals after smoothing
+    # 7. Recompute outward vertex normals after smoothing
     v0 = verts[faces[:, 0]]
     v1 = verts[faces[:, 1]]
     v2 = verts[faces[:, 2]]
@@ -235,6 +352,17 @@ def blockout(views: dict[str, Any], reference: dict, height_cm: float, dst: Path
     is_back = (abs_ny >= abs_nx) & (abs_ny >= abs_nz) & (ny > 0)
     # Dominant X:
     is_side = (abs_nx > abs_ny) & (abs_nx >= abs_nz)
+
+    # Lateral arm vertices (and thigh slices overlapped by side-view hands in A-pose) sample front/back colors
+    vk = np.clip(np.round(vz).astype(int), 0, Nz - 1)
+    on_lat_arm = (vx < torso_x_bounds[vk, 0] - 1.5) | (vx > torso_x_bounds[vk, 1] + 1.5)
+    has_apose_arms = bool(np.any(torso_x_bounds[:, 0] > 0.5))
+    hand_overlap_zone = has_apose_arms & (vk >= int(0.35 * Nz)) & (vk <= int(0.53 * Nz))
+    no_side_proj = on_lat_arm | hand_overlap_zone
+    is_side = is_side & ~no_side_proj
+    is_front = is_front | (no_side_proj & (ny <= 0))
+    is_back = is_back | (no_side_proj & (ny > 0))
+
     # Top/Bottom:
     is_top_bottom = ~is_front & ~is_back & ~is_side
     is_top_front = is_top_bottom & (ny <= 0)

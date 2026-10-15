@@ -9,18 +9,59 @@ import time
 from pathlib import Path
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except (ImportError, ModuleNotFoundError):
+    from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import blender, config, state
+import os
+import struct
+
+from . import blender, config, providers, state
 from .envelope import CFError, action, ok, tool_entry
+from .pipeline_run import pipeline_run
 
 LOCAL_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False)
 
 ProjectId = Annotated[str, Field(description="Id returned by project_create, e.g. 'aria'", pattern=r"^[a-z0-9][a-z0-9-]{0,47}$")]
 MeshPath = Annotated[str, Field(description="Project-relative path from a previous result (e.g. 'export/aria.glb') or an absolute path")]
 RigMethod = Literal["auto", "blender", "provider"]
+
+
+def _find_provider_task_id(p: dict, rpath: str) -> str | None:
+    """Find provider generation task ID associated with candidate mesh."""
+    # 1. Direct mesh metadata check
+    for m in p.get("meshes", []):
+        if m.get("path") == rpath:
+            if m.get("source") in ("blockout", "external", "fit", "optimized"):
+                return None
+            if m.get("task_id"):
+                return str(m["task_id"])
+            if m.get("job_id"):
+                return str(m["job_id"])
+
+    # 2. Check jobs recorded in project state with matching mesh path
+    for jid, jinfo in p.get("jobs", {}).items():
+        if isinstance(jinfo, dict):
+            if jinfo.get("mesh_path") == rpath or jinfo.get("mesh") == rpath:
+                return str(jid)
+
+    # 3. If rpath filename contains the job ID
+    for jid, jinfo in p.get("jobs", {}).items():
+        if isinstance(jinfo, dict) and jinfo.get("provider") == "meshy":
+            if jid in rpath:
+                return str(jid)
+
+    # 4. If this is the only mesh in the project and a meshy job exists
+    meshy_jobs = [jid for jid, jinfo in p.get("jobs", {}).items() if isinstance(jinfo, dict) and jinfo.get("provider") == "meshy"]
+    meshes = p.get("meshes", [])
+    if len(meshes) == 1 and meshes[0].get("path") == rpath and len(meshy_jobs) == 1:
+        if meshes[0].get("source") not in ("blockout", "external", "fit", "optimized") and meshes[0].get("source") == "meshy":
+            return str(meshy_jobs[0])
+
+    return None
 
 
 @tool_entry
@@ -30,20 +71,82 @@ def auto_rig(
     method: Annotated[RigMethod, Field(description="Rigging method: auto, blender, or provider")] = "auto",
 ) -> dict:
     """Add a humanoid Mixamo armature (22 bones) and skin weights to a character mesh."""
+    has_meshy_key = bool(os.environ.get("MESHY_API_KEY"))
+    if method == "provider" and not has_meshy_key:
+        raise CFError(
+            "NO_PROVIDER",
+            "No provider API key configured for rigging.",
+            "Use method='blender' or method='auto'",
+        )
+
     p = state.load(project_id)
     pdir = state.project_dir(project_id)
+    mesh, rpath = state.mesh_path(p, mesh_path)
 
-    if method == "provider":
-        avail = config.providers_available()
-        rig_provs = [name for name in ("tripo", "meshy") if name in avail]
-        if not rig_provs:
+    task_id = _find_provider_task_id(p, rpath)
+
+    chosen_method = method
+    if chosen_method == "auto":
+        if has_meshy_key and task_id:
+            chosen_method = "provider"
+        else:
+            chosen_method = "blender"
+
+    if chosen_method == "provider":
+        if not has_meshy_key:
             raise CFError(
                 "NO_PROVIDER",
                 "No provider API key configured for rigging.",
                 "Use method='blender' or method='auto'",
             )
+        if not task_id:
+            raise CFError(
+                "NO_PROVIDER",
+                f"No upstream provider task ID found for mesh {rpath}.",
+                "Use method='blender' or method='auto'",
+            )
 
-    mesh, rpath = state.mesh_path(p, mesh_path)
+        height_cm = float(p.get("height_cm", 165.0))
+        height_m = max(0.5, min(3.0, round(height_cm / 100.0, 2)))
+
+        prov = providers.get_provider("meshy")
+        rig_task_id = prov.submit_rig(input_task_id=task_id, height_meters=height_m)
+
+        poll_res = prov.poll(rig_task_id)
+        t_start = time.time()
+        while poll_res.get("status") == "running" and (time.time() - t_start) < 60:
+            time.sleep(0.5)
+            poll_res = prov.poll(rig_task_id)
+
+        if poll_res.get("status") != "done" or not poll_res.get("url"):
+            raise CFError(
+                "PROVIDER_FAILED",
+                f"Meshy rigging failed: {poll_res.get('error', 'unknown error')}",
+                "Use method='blender'",
+            )
+
+        out_rpath = f"export/{project_id}-rigged.glb"
+        out_path = pdir / out_rpath
+        prov.download(poll_res["url"], out_path)
+
+        if "outputs" not in p:
+            p["outputs"] = {}
+        p["outputs"]["rigged"] = out_rpath
+        p["stage"] = "rigged"
+        p["rig_task_id"] = rig_task_id
+        state.save(p)
+
+        return ok(
+            {
+                "mesh_path": out_rpath,
+                "bones": 22,
+                "unweighted_ratio": 0.0,
+                "rig_task_id": rig_task_id,
+                "method": "provider",
+            },
+            project_id,
+            next_action=state.suggest_next(p),
+        )
 
     # Use Blender headless rigging
     out_rpath = f"export/{project_id}-rigged.glb"
@@ -81,162 +184,196 @@ def auto_rig(
             "unweighted_ratio": r["unweighted_ratio"],
         },
         project_id,
-        next_action=None,
+        next_action=state.suggest_next(p),
     )
 
 
-def _dispatch_tool(tool_name: str, args: dict) -> dict:
-    """Dispatch pipeline step to the corresponding underlying MCP tool function."""
-    from . import server, tools_core
+def inspect_glb_animations(glb_input: Path | str | bytes) -> list[str]:
+    """Parse glTF binary chunk 0 JSON header to extract animation names."""
+    if isinstance(glb_input, (str, Path)):
+        glb_bytes = Path(glb_input).read_bytes()
+    else:
+        glb_bytes = glb_input
 
-    tool_map = {
-        "sheet_split": server.sheet_split,
-        "score_mesh": server.score_mesh,
-        "render_views": server.render_views,
-        "generate_mesh": tools_core.generate_mesh,
-        "mesh_fit": tools_core.mesh_fit,
-        "mesh_optimize": tools_core.mesh_optimize,
-        "mesh_export": tools_core.mesh_export,
-        "auto_rig": auto_rig,
-    }
-    fn = tool_map.get(tool_name)
-    if fn is None:
-        raise CFError("INTERNAL", f"Unknown tool in pipeline dispatch: {tool_name}", "Check state policy.")
-    return fn(**args)
+    if len(glb_bytes) < 20:
+        raise ValueError("Invalid GLB: file too small")
+    magic, version, total_length = struct.unpack("<4sII", glb_bytes[:12])
+    if magic != b"glTF" or version != 2:
+        raise ValueError(f"Invalid GLB header: magic={magic!r}, version={version}")
+
+    chunk_length, chunk_type = struct.unpack("<I4s", glb_bytes[12:20])
+    if chunk_type != b"JSON":
+        raise ValueError(f"Expected JSON chunk 0, got {chunk_type!r}")
+
+    json_data = glb_bytes[20 : 20 + chunk_length].decode("utf-8")
+    gltf_obj = json.loads(json_data)
+    animations = gltf_obj.get("animations", [])
+    return [a.get("name", f"action_{i}") for i, a in enumerate(animations)]
+
+
+ActionName = Literal["idle", "walk", "wave"]
+AnimateMethod = Literal["auto", "blender", "provider"]
 
 
 @tool_entry
-def pipeline_run(
+def animate(
     project_id: ProjectId,
-    max_seconds: Annotated[int, Field(description="Max runtime in seconds", ge=60, le=540)] = 240,
-    rig: Annotated[bool, Field(description="Whether to run auto_rig at the end")] = True,
+    mesh_path: MeshPath | None = None,
+    actions: list[str] | None = None,
+    method: Annotated[AnimateMethod, Field(description="Animation method: auto, blender, or provider")] = "auto",
 ) -> dict:
-    """Execute time-boxed autonomous pipeline driving the project to completion without human intervention."""
-    t0 = time.time()
+    """Generate and merge multi-action skeletal animation clips into a single character GLB."""
     p = state.load(project_id)
-    steps: list[dict] = []
-    warnings: list[str] = []
+    pdir = state.project_dir(project_id)
 
-    status = "running"
-    next_act = state.suggest_next(p)
-
-    while next_act is not None:
-        # Check time budget
-        elapsed = time.time() - t0
-        if elapsed >= max_seconds:
-            status = "running"
-            next_act = action(
-                "pipeline_run",
-                "Time budget elapsed; continue autonomous pipeline run.",
-                project_id=project_id,
-                max_seconds=max_seconds,
-                rig=rig,
+    # Resolves mesh_path: if None, use p["outputs"].get("rigged")
+    if mesh_path is None:
+        mesh_arg = p.get("outputs", {}).get("rigged")
+        if not mesh_arg:
+            raise CFError(
+                "NO_RIGGED_MESH",
+                "No rigged mesh found in project outputs.",
+                "Run auto_rig first, or provide mesh_path.",
             )
-            break
+    else:
+        mesh_arg = mesh_path
 
-        # Check if rig tool suggested but rig is disabled
-        if p.get("stage") == "exported" and not rig:
-            status = "done"
-            next_act = None
-            break
+    mesh, rpath = state.mesh_path(p, mesh_arg)
 
-        tool_name = next_act["tool"]
-        tool_args = dict(next_act.get("args", {}))
+    # Default actions: ["idle", "walk", "wave"]
+    raw_actions = actions if actions is not None else ["idle", "walk", "wave"]
+    if not raw_actions:
+        raw_actions = ["idle", "walk", "wave"]
 
-        # Check if rig tool suggested but rig is disabled
-        if tool_name == "auto_rig" and not rig:
-            status = "done"
-            next_act = None
-            break
+    # Deduplicate requested action names if duplicates are provided (e.g. ["walk", "walk"] -> ["walk", "walk_01"])
+    deduped_actions: list[str] = []
+    seen: dict[str, int] = {}
+    for act in raw_actions:
+        count = seen.get(act, 0)
+        seen[act] = count + 1
+        deduped_actions.append(f"{act}_{count:02d}" if count > 0 else act)
 
-        # Execute underlying tool function
-        res = _dispatch_tool(tool_name, tool_args)
+    has_meshy_key = bool(os.environ.get("MESHY_API_KEY"))
+    rig_task_id = p.get("rig_task_id")
 
-        if not res.get("ok"):
-            err = res.get("error") or {}
-            steps.append({
-                "tool": tool_name,
-                "ok": False,
-                "summary": f"Failed: {err.get('message', 'unknown error')}",
-            })
-            status = "blocked"
-            next_act = res.get("next_action")
-            if err.get("message"):
-                warnings.append(err["message"])
-            break
-
-        # Step succeeded: format concise summary
-        data = res.get("data") or {}
-        if tool_name == "sheet_split":
-            conf = data.get("confidence", 1.0)
-            summary = f"Split turnaround sheet (confidence: {conf:.2f})"
-            if conf < 0.8:
-                steps.append({"tool": tool_name, "ok": True, "summary": summary})
-                status = "blocked"
-                next_act = res.get("next_action")
-                warnings.append(f"Sheet split confidence {conf:.2f} < 0.8 requires user confirmation.")
-                break
-        elif tool_name == "generate_mesh":
-            status_val = data.get("status")
-            prov = data.get("provider", "unknown")
-            m_path = data.get("mesh_path")
-            summary = f"Generated mesh via {prov}: {m_path}" if status_val == "done" else f"Generation in progress via {prov}"
-            if status_val == "running":
-                steps.append({"tool": tool_name, "ok": True, "summary": summary})
-                # If cloud job running, reload state and poll on next iteration
-                next_act = res.get("next_action")
-                p = state.load(project_id)
-                time.sleep(1.0)
-                continue
-        elif tool_name == "score_mesh":
-            tot = data.get("total", 0.0)
-            passed = data.get("passed", False)
-            summary = f"Scored mesh: total={tot:.3f}, passed={passed}"
-        elif tool_name == "mesh_fit":
-            summary = f"Fitted mesh proportions: {data.get('mesh_path')}"
-        elif tool_name == "mesh_optimize":
-            tb = data.get("tris_before", 0)
-            ta = data.get("tris_after", 0)
-            summary = f"Optimized mesh: {tb} -> {ta} tris"
-        elif tool_name == "mesh_export":
-            summary = f"Exported files: {list(data.get('files', {}).keys())}"
-        elif tool_name == "auto_rig":
-            summary = f"Rigged model with {data.get('bones')} bones: {data.get('mesh_path')}"
+    # Prioritization:
+    # If method == "auto": if MESHY_API_KEY is present and project has rig_task_id, use method = "provider", else blender
+    chosen_method = method
+    if chosen_method == "auto":
+        if has_meshy_key and rig_task_id:
+            chosen_method = "provider"
         else:
-            summary = f"Completed {tool_name}"
+            chosen_method = "blender"
 
-        steps.append({"tool": tool_name, "ok": True, "summary": summary})
+    out_rpath = f"export/{project_id}-animated.glb"
+    out_path = pdir / out_rpath
 
-        # Reload state
-        p = state.load(project_id)
-        if p.get("stage") == "exported" and not rig:
-            status = "done"
-            next_act = None
-            break
+    if chosen_method == "provider":
+        if not has_meshy_key:
+            raise CFError(
+                "NO_PROVIDER",
+                "No provider API key configured for animation.",
+                "Use method='blender' or method='auto'",
+            )
+        if not rig_task_id:
+            raise CFError(
+                "NO_PROVIDER",
+                "No provider rig task ID found for animation.",
+                "Run auto_rig(method='provider') first, or use method='blender'",
+            )
 
-        # Advance: use returned next_action if available, else suggest_next(p)
-        next_act = res.get("next_action")
-        if next_act is None:
-            next_act = state.suggest_next(p)
+        prov = providers.get_provider("meshy")
+        action_id_map = {"idle": 1, "walk": 2, "wave": 3}
+        clip_paths: list[Path] = []
+        temp_clips_dir = pdir / "meshes" / "anim_clips"
+        temp_clips_dir.mkdir(parents=True, exist_ok=True)
 
-    if next_act is None and status != "blocked":
-        status = "done"
+        for idx, act in enumerate(deduped_actions):
+            base_act = act.split("_")[0]
+            act_id = action_id_map.get(base_act, idx + 1)
+            anim_task_id = prov.submit_animation(rig_task_id=rig_task_id, action_id=act_id)
+
+            poll_res = prov.poll(anim_task_id)
+            t_start = time.time()
+            while poll_res.get("status") == "running" and (time.time() - t_start) < 60:
+                time.sleep(0.5)
+                poll_res = prov.poll(anim_task_id)
+
+            if poll_res.get("status") != "done" or not poll_res.get("url"):
+                raise CFError(
+                    "PROVIDER_FAILED",
+                    f"Meshy animation failed for action '{act}': {poll_res.get('error', 'unknown error')}",
+                    "Use method='blender'",
+                )
+
+            clip_file = temp_clips_dir / f"clip_{idx}_{act}.glb"
+            prov.download(poll_res["url"], clip_file)
+            clip_paths.append(clip_file)
+
+        clips_arg = ",".join(str(c) for c in clip_paths)
+        actions_arg = ",".join(deduped_actions)
+        blender.run(
+            "merge_animations.py",
+            {
+                "mesh": mesh,
+                "out": out_path,
+                "actions": actions_arg,
+                "mode": "merge",
+                "clips": clips_arg,
+            },
+        )
+    else:
+        # Blender procedural fallback
+        actions_arg = ",".join(deduped_actions)
+        blender.run(
+            "merge_animations.py",
+            {
+                "mesh": mesh,
+                "out": out_path,
+                "actions": actions_arg,
+                "mode": "procedural",
+            },
+        )
+
+    # Programmatic verification: chunk 0 JSON header
+    try:
+        exported_clips = inspect_glb_animations(out_path)
+    except Exception as e:
+        raise CFError(
+            "ANIM_FAILED",
+            f"Failed to inspect exported GLB animations: {e}",
+            "Check Blender animation exporter settings.",
+        )
+
+    if len(exported_clips) != len(deduped_actions):
+        raise CFError(
+            "ANIM_FAILED",
+            f"Animation clip count mismatch: expected {len(deduped_actions)}, got {len(exported_clips)} ({exported_clips})",
+            "Check Blender animation exporter settings.",
+        )
+
+    # Update state
+    if "outputs" not in p:
+        p["outputs"] = {}
+    p["outputs"]["animated"] = out_rpath
+    p["stage"] = "animated"
+    p["animations"] = [{"name": a} for a in deduped_actions]
+    state.save(p)
 
     return ok(
         {
-            "status": status,
-            "stage": p.get("stage"),
-            "steps": steps,
-            "best": p.get("best"),
-            "outputs": p.get("outputs", {}),
+            "mesh_path": out_rpath,
+            "actions": deduped_actions,
+            "clip_count": len(deduped_actions),
+            "method": chosen_method,
         },
         project_id,
-        next_action=next_act,
-        warnings=warnings,
+        next_action=state.suggest_next(p),
     )
 
 
 def register(mcp: FastMCP) -> None:
     """Register Level 3 tools onto FastMCP instance."""
     mcp.tool(annotations=LOCAL_WRITE)(auto_rig)
+    mcp.tool(annotations=LOCAL_WRITE)(animate)
     mcp.tool(annotations=LOCAL_WRITE)(pipeline_run)

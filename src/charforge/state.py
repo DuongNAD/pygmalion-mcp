@@ -105,9 +105,20 @@ def mesh_path(p: dict, arg: str) -> tuple[Path, str]:
     return src, rpath
 
 
-def register_mesh(p: dict, rpath: str, source: str, **meta) -> None:
-    if not any(m["path"] == rpath for m in p["meshes"]):
-        p["meshes"].append({"path": rpath, "source": source, "rotate_z": 0, "created_at": _now(), **meta})
+def register_mesh(p: dict, rpath: str, source: str = "blockout", seed: int | None = None, task_id: str | None = None, **meta) -> None:
+    existing = next((m for m in p["meshes"] if m["path"] == rpath), None)
+    if existing is not None:
+        if task_id is not None and not existing.get("task_id"):
+            existing["task_id"] = task_id
+        if seed is not None and "seed" not in existing:
+            existing["seed"] = seed
+        return
+    entry = {"path": rpath, "source": source, "rotate_z": 0, "created_at": _now(), **meta}
+    if seed is not None:
+        entry["seed"] = seed
+    if task_id is not None:
+        entry["task_id"] = task_id
+    p["meshes"].append(entry)
 
 
 def render_dir(p: dict, rpath: str) -> Path:
@@ -161,6 +172,10 @@ def suggest_next(p: dict) -> dict | None:
         return action("mesh_export", "Export the optimized mesh.", project_id=pid, mesh_path=p["outputs"].get("optimized"), format="glb")
     if st == "exported" and lvl >= 3:
         return action("auto_rig", "Add a humanoid rig.", project_id=pid, mesh_path=p["outputs"].get("glb"))
+    if st == "rigged" and lvl >= 3:
+        return action("animate", "Generate skeletal animations for the rigged character.", project_id=pid, mesh_path=p["outputs"].get("rigged"))
+    if st == "animated":
+        return None
     return None
 
 

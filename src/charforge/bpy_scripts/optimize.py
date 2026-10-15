@@ -82,14 +82,57 @@ def main():
         bpy.ops.mesh.normals_make_consistent(inside=False)
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        # 2. Decimate to target_tris
+        # 2. Decimate to target_tris while protecting high-contrast vertex-color features
         cur_tris = count_tris([mesh_obj])
         if cur_tris > args.target_tris:
+            dec_vg = None
+            if mesh_obj.data.color_attributes:
+                ca = mesh_obj.data.color_attributes[0]
+                n_v = len(mesh_obj.data.vertices)
+                if ca.domain == 'POINT' and len(ca.data) == n_v:
+                    v_cols = [(c.color[0], c.color[1], c.color[2]) for c in ca.data]
+                    max_diff = [0.0] * n_v
+                    for e in mesh_obj.data.edges:
+                        u, v = e.vertices[0], e.vertices[1]
+                        cu, cv = v_cols[u], v_cols[v]
+                        d = abs(cu[0] - cv[0]) + abs(cu[1] - cv[1]) + abs(cu[2] - cv[2])
+                        if d > max_diff[u]:
+                            max_diff[u] = d
+                        if d > max_diff[v]:
+                            max_diff[v] = d
+                    ring_diff = list(max_diff)
+                    for e in mesh_obj.data.edges:
+                        u, v = e.vertices[0], e.vertices[1]
+                        if max_diff[v] > 0.08 and ring_diff[u] < 0.05:
+                            ring_diff[u] = 0.05
+                        if max_diff[u] > 0.08 and ring_diff[v] < 0.05:
+                            ring_diff[v] = 0.05
+                    n_prot = sum(1 for d in ring_diff if d > 0.04)
+                    if 0 < n_prot < 0.40 * n_v:
+                        dec_vg = mesh_obj.vertex_groups.new(name="_charforge_decimate")
+                        for idx, d in enumerate(ring_diff):
+                            w = 0.0 if d > 0.08 else (0.25 if d > 0.04 else 1.0)
+                            dec_vg.add([idx], w, 'REPLACE')
+
             ratio = max(0.001, min(1.0, args.target_tris / cur_tris))
             mod = mesh_obj.modifiers.new(name="Decimate", type='DECIMATE')
             mod.decimate_type = 'COLLAPSE'
             mod.ratio = ratio
+            if dec_vg is not None:
+                mod.vertex_group = dec_vg.name
+                mod.vertex_group_factor = 1.0
             bpy.ops.object.modifier_apply(modifier="Decimate")
+
+            vg_post = mesh_obj.vertex_groups.get("_charforge_decimate")
+            if vg_post is not None:
+                mesh_obj.vertex_groups.remove(vg_post)
+
+            cur_tris_post = count_tris([mesh_obj])
+            if cur_tris_post > args.target_tris * 1.03:
+                mod2 = mesh_obj.modifiers.new(name="Decimate2", type='DECIMATE')
+                mod2.decimate_type = 'COLLAPSE'
+                mod2.ratio = max(0.001, min(1.0, args.target_tris / cur_tris_post))
+                bpy.ops.object.modifier_apply(modifier="Decimate2")
 
         # 3. Smart UV project if missing UVs
         if not mesh_obj.data.uv_layers:
@@ -97,6 +140,10 @@ def main():
             bpy.ops.mesh.select_all(action='SELECT')
             bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
             bpy.ops.object.mode_set(mode='OBJECT')
+
+        # 4. Enable smooth polygon shading for clean 3D rendering
+        for poly in mesh_obj.data.polygons:
+            poly.use_smooth = True
 
         tris_after = count_tris([mesh_obj])
 

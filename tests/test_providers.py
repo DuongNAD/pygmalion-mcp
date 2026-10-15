@@ -16,7 +16,9 @@ def test_level_2_tools_registered(monkeypatch):
     server._register_levels()
 
     # List registered tool names on server.mcp
-    registered_tools = [t.name for t in server.mcp._tool_manager.list_tools()]
+    import asyncio
+    tools = asyncio.run(server.mcp.list_tools()) if asyncio.iscoroutinefunction(server.mcp.list_tools) else server.mcp.list_tools()
+    registered_tools = [t.name for t in tools]
     assert "generate_mesh" in registered_tools
     assert "mesh_fit" in registered_tools
     assert "mesh_optimize" in registered_tools
@@ -219,4 +221,293 @@ def test_provider_hunyuan_lifecycle(tmp_path):
     dl_dst = tmp_path / "hunyuan.glb"
     p.download(done_res["url"], dl_dst)
     assert dl_dst.read_bytes() == dummy_glb
+
+
+def test_meshy_provider_multiview_and_rig_and_anim(tmp_path):
+    """Verify MeshyProvider submit_multiview, submit_rig, and submit_animation methods."""
+    recorded = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(request)
+        url_str = str(request.url)
+        if request.method == "POST" and url_str.endswith("/multi-image-to-3d"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert len(body["image_urls"]) == 3
+            assert body["pose_mode"] == "a-pose"
+            assert body["ai_model"] == "latest"
+            assert body["enable_pbr"] is True
+            return httpx.Response(202, json={"result": "meshy-mv-001"})
+        elif request.method == "POST" and url_str.endswith("/rigging"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["input_task_id"] == "meshy-mv-001"
+            assert body["height_meters"] == 1.72
+            return httpx.Response(200, json={"result": "rig_meshy-mv-001"})
+        elif request.method == "POST" and url_str.endswith("/animations"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["rig_task_id"] == "rig_meshy-mv-001"
+            assert body["action_id"] == 1
+            return httpx.Response(200, json={"result": "anim_rig_001"})
+        elif request.method == "GET" and "/multi-image-to-3d/meshy-mv-001" in url_str:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/mv.glb"}})
+        elif request.method == "GET" and "/rigging/rig_meshy-mv-001" in url_str:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rig.glb"}})
+        elif request.method == "GET" and "/animations/anim_rig_001" in url_str:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/anim.glb"}})
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = providers.MeshyProvider(api_key="meshy-key", client=client)
+
+    views = {}
+    for name in ("front", "side", "back"):
+        f = tmp_path / f"{name}.png"
+        f.write_bytes(f"img-{name}".encode())
+        views[name] = f
+
+    # 1. submit_multiview
+    job_id = p.submit_multiview(views, pose_mode="a-pose")
+    assert job_id == "meshy-mv-001"
+    poll_mv = p.poll(job_id)
+    assert poll_mv["status"] == "done"
+    assert poll_mv["url"] == "https://meshy.mock/mv.glb"
+
+    # 2. submit_rig
+    rig_id = p.submit_rig(input_task_id=job_id, height_meters=1.72)
+    assert rig_id == "rig_meshy-mv-001"
+    poll_rig = p.poll_rig(rig_id)
+    assert poll_rig["status"] == "done"
+    assert poll_rig["url"] == "https://meshy.mock/rig.glb"
+
+    # 3. submit_animation
+    anim_id = p.submit_animation(rig_task_id=rig_id, action_id=1)
+    assert anim_id == "anim_rig_001"
+    poll_anim = p.poll_animation(anim_id)
+    assert poll_anim["status"] == "done"
+    assert poll_anim["url"] == "https://meshy.mock/anim.glb"
+
+    # 4. poll dispatch via generic poll(job_id)
+    assert p.poll(rig_id)["status"] == "done"
+    assert p.poll(anim_id)["status"] == "done"
+
+
+def test_tripo_provider_upload_and_multiview_mapping(tmp_path):
+    """Verify TripoProvider upload_image, submit_multiview, and directional side_faces mapping."""
+    uploaded_files = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "POST" and url_str.endswith("/upload"):
+            token = f"tok-{len(uploaded_files) + 1}"
+            uploaded_files[token] = request.content
+            return httpx.Response(200, json={"code": 0, "data": {"image_token": token}})
+        elif request.method == "POST" and url_str.endswith("/task"):
+            body = json.loads(request.content.decode("utf-8"))
+            inputs = body.get("inputs", {})
+            return httpx.Response(200, json={"code": 0, "data": {"task_id": "tripo-task-mapped", "inputs": inputs}})
+        elif request.method == "GET" and "/task/tripo-task-mapped" in url_str:
+            return httpx.Response(200, json={"code": 0, "data": {"status": "success", "output": {"pbr_model": "https://tripo.mock/model.glb"}}})
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = providers.TripoProvider(api_key="tripo-key", client=client)
+
+    # 1. upload_image directly
+    tok = p.upload_image(b"fake-bytes", "test.png")
+    assert tok == "tok-1"
+
+    # 2. submit with reference.side_faces == 'right' -> maps to 'left'
+    front_p = tmp_path / "front.png"
+    front_p.write_bytes(b"front")
+    side_p = tmp_path / "side.png"
+    side_p.write_bytes(b"side")
+
+    job_id1 = p.submit({"front": front_p, "side": side_p}, reference={"side_faces": "right"})
+    assert job_id1 == "tripo-task-mapped"
+
+    # 3. submit with reference.side_faces == 'left' -> maps to 'right'
+    job_id2 = p.submit({"front": front_p, "side": side_p}, reference={"side_faces": "left"})
+    assert job_id2 == "tripo-task-mapped"
+
+    # 4. poll
+    poll_res = p.poll(job_id1)
+    assert poll_res["status"] == "done"
+    assert poll_res["url"] == "https://tripo.mock/model.glb"
+
+
+def test_rodin_provider_multipart_and_download(tmp_path):
+    """Verify RodinProvider submit_multipart, get_download_url, and status polling."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "POST" and url_str.endswith("/rodin"):
+            return httpx.Response(
+                200,
+                json={"uuid": "rodin-uuid-123", "jobs": {"subscription_key": "sub-key-456"}},
+            )
+        elif request.method == "POST" and url_str.endswith("/status"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["subscription_key"] == "sub-key-456"
+            return httpx.Response(200, json={"status": "completed"})
+        elif request.method == "POST" and url_str.endswith("/download"):
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["task_uuid"] == "rodin-uuid-123"
+            return httpx.Response(200, json={"url": "https://rodin.mock/download.glb", "name": "download.glb"})
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    p = providers.RodinProvider(api_key="rodin-key", client=client)
+
+    front_p = tmp_path / "front.png"
+    front_p.write_bytes(b"front-data")
+    job_id = p.submit({"front": front_p})
+    assert job_id == "rodin-uuid-123:sub-key-456"
+
+    # Polling status invokes get_download_url under the hood
+    poll_res = p.poll(job_id)
+    assert poll_res["status"] == "done"
+    assert poll_res["url"] == "https://rodin.mock/download.glb"
+
+    # Direct get_download_url
+    dl_url = p.get_download_url("rodin-uuid-123")
+    assert dl_url == "https://rodin.mock/download.glb"
+
+
+def test_auto_rig_prioritization(sheet_path, monkeypatch, tmp_path):
+    """Verify auto_rig(method='auto') prioritizes provider when MESHY_API_KEY + task_id exist."""
+    from charforge import tools_full
+
+    monkeypatch.setenv("CHARFORGE_LEVEL", "3")
+    server._register_levels()
+
+    cr = server.project_create(sheet_path=str(sheet_path), name="AutoRigPrioritySuite", height_cm=170.0)
+    pid = cr["project_id"]
+    pdir = state.project_dir(pid)
+
+    # Create dummy mesh
+    mesh_rel = "meshes/cand-1-meshy.glb"
+    mesh_full = pdir / mesh_rel
+    mesh_full.parent.mkdir(parents=True, exist_ok=True)
+    mesh_full.write_bytes(b"dummy-glb")
+
+    # Register mesh in project with provider task_id via state.register_mesh
+    p = state.load(pid)
+    state.register_mesh(p, mesh_rel, source="meshy", task_id="meshy-upstream-task-789")
+    p["jobs"]["meshy-upstream-task-789"] = {"provider": "meshy", "status": "done", "mesh_path": mesh_rel}
+    state.save(p)
+
+    # 1. Mock Meshy transport for rigging
+    dummy_rigged_glb = b"glTF\x02\x00\x00\x00\x18\x00\x00\x00JSON{\"rigged\":true}"
+    def handler(request: httpx.Request) -> httpx.Response:
+        url_str = str(request.url)
+        if request.method == "POST" and "/openapi/v1/rigging" in url_str:
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["input_task_id"] == "meshy-upstream-task-789"
+            assert body["height_meters"] == 1.70
+            return httpx.Response(200, json={"result": "rig_meshy_task_789"})
+        elif request.method == "GET" and "/openapi/v1/rigging/rig_meshy_task_789" in url_str:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rigged.glb"}})
+        elif request.method == "GET" and "meshy.mock/rigged.glb" in url_str:
+            return httpx.Response(200, content=dummy_rigged_glb)
+        return httpx.Response(404)
+
+    mock_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setenv("MESHY_API_KEY", "valid-meshy-key")
+    monkeypatch.setattr(providers, "get_provider", lambda name, client=None: providers.MeshyProvider(api_key="valid-meshy-key", client=mock_client))
+
+    # Run auto_rig with method="auto": should pick provider
+    res = tools_full.auto_rig(project_id=pid, mesh_path=mesh_rel, method="auto")
+    assert res["ok"] is True
+    assert res["data"]["method"] == "provider"
+    assert res["data"]["rig_task_id"] == "rig_meshy_task_789"
+    assert (pdir / res["data"]["mesh_path"]).read_bytes() == dummy_rigged_glb
+
+    # 2. When method="provider" without MESHY_API_KEY, raises NO_PROVIDER
+    monkeypatch.delenv("MESHY_API_KEY", raising=False)
+    res_nokey = tools_full.auto_rig(project_id=pid, mesh_path=mesh_rel, method="provider")
+    assert res_nokey["ok"] is False
+    assert res_nokey["error"]["code"] == "NO_PROVIDER"
+
+    # 3. When method="provider" with MESHY_API_KEY but candidate has no task_id, raises NO_PROVIDER
+    monkeypatch.setenv("MESHY_API_KEY", "valid-meshy-key")
+    unknown_rel = "meshes/orphan.glb"
+    (pdir / unknown_rel).write_bytes(b"dummy")
+    p = state.load(pid)
+    state.register_mesh(p, unknown_rel, source="blockout")
+    state.save(p)
+    res_notask = tools_full.auto_rig(project_id=pid, mesh_path=unknown_rel, method="provider")
+    assert res_notask["ok"] is False
+    assert res_notask["error"]["code"] == "NO_PROVIDER"
+
+
+def test_generate_mesh_to_auto_rig_real_pipeline_flow(sheet_path, monkeypatch, tmp_path):
+    """Verify real pipeline flow from generate_mesh to auto_rig(method='provider')."""
+    from charforge import tools_full, tools_core
+
+    monkeypatch.setenv("CHARFORGE_LEVEL", "3")
+    server._register_levels()
+
+    cr = server.project_create(sheet_path=str(sheet_path), name="RealPipelineFlow", height_cm=170.0)
+    pid = cr["project_id"]
+    pdir = state.project_dir(pid)
+
+    # Set up dummy views in project
+    (pdir / "views").mkdir(parents=True, exist_ok=True)
+    for v in ("front", "side", "back"):
+        f = pdir / "views" / f"{v}.png"
+        f.write_bytes(b"dummy-image")
+        p = state.load(pid)
+        p.setdefault("views", {})[v] = {"image": f"views/{v}.png"}
+        state.save(p)
+
+    # Register pre-existing blockout mesh (multiple meshes scenario)
+    p = state.load(pid)
+    state.register_mesh(p, "meshes/cand-1-blockout.ply", source="blockout")
+    state.save(p)
+
+    dummy_gen_glb = b"glTF\x02\x00\x00\x00\x14\x00\x00\x00JSON{}"
+    dummy_rig_glb = b"glTF\x02\x00\x00\x00\x18\x00\x00\x00JSON{\"rig\":1}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        u = str(request.url)
+        if request.method == "POST" and "/openapi/v1/multi-image-to-3d" in u:
+            return httpx.Response(200, json={"result": "meshy-gen-task-101"})
+        elif request.method == "GET" and "/openapi/v1/multi-image-to-3d/meshy-gen-task-101" in u:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/model.glb"}})
+        elif request.method == "GET" and "meshy.mock/model.glb" in u:
+            return httpx.Response(200, content=dummy_gen_glb)
+        elif request.method == "POST" and "/openapi/v1/rigging" in u:
+            body = json.loads(request.content.decode("utf-8"))
+            assert body["input_task_id"] == "meshy-gen-task-101"
+            return httpx.Response(200, json={"result": "meshy-rig-task-202"})
+        elif request.method == "GET" and "/openapi/v1/rigging/meshy-rig-task-202" in u:
+            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rigged.glb"}})
+        elif request.method == "GET" and "meshy.mock/rigged.glb" in u:
+            return httpx.Response(200, content=dummy_rig_glb)
+        return httpx.Response(404)
+
+    mock_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setenv("MESHY_API_KEY", "valid-meshy-key")
+    monkeypatch.setattr(providers, "get_provider", lambda name, client=None: providers.MeshyProvider(api_key="valid-meshy-key", client=mock_client))
+
+    # 1. Execute generate_mesh with provider="meshy"
+    gen_res = tools_core.generate_mesh(project_id=pid, provider="meshy")
+    assert gen_res["ok"] is True
+    assert gen_res["data"]["status"] == "done"
+    meshy_mesh_path = gen_res["data"]["mesh_path"]
+    assert meshy_mesh_path == "meshes/cand-2-meshy.glb"
+
+    # Verify project state has task_id and mesh_path recorded
+    p = state.load(pid)
+    meshy_mesh_entry = next(m for m in p["meshes"] if m["path"] == meshy_mesh_path)
+    assert meshy_mesh_entry["task_id"] == "meshy-gen-task-101"
+    assert p["jobs"]["meshy-gen-task-101"]["mesh_path"] == meshy_mesh_path
+
+    # 2. Execute auto_rig with method="provider" on the generated mesh
+    rig_res = tools_full.auto_rig(project_id=pid, mesh_path=meshy_mesh_path, method="provider")
+    assert rig_res["ok"] is True
+    assert rig_res["data"]["method"] == "provider"
+    assert rig_res["data"]["rig_task_id"] == "meshy-rig-task-202"
+
+    # 3. Verify blockout mesh with method="auto" does NOT use provider
+    assert tools_full._find_provider_task_id(p, "meshes/cand-1-blockout.ply") is None
+
 

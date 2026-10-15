@@ -114,3 +114,48 @@ def test_fit_with_rotate_z_bakes_rotation(tmp_path):
     assert dims[1] == pytest.approx(0.40, rel=0.01)
     assert dims[0] < 0.05
 
+
+def _create_armed_mesh(path: Path) -> Path:
+    """Create a humanoid mesh with body column and extended arms (T-pose)."""
+    verts = [
+        (-0.15, 0.0, -0.1), (0.15, 0.0, -0.1), (0.15, 0.0, 0.1), (-0.15, 0.0, 0.1),
+        (-0.15, 1.65, -0.1), (0.15, 1.65, -0.1), (0.15, 1.65, 0.1), (-0.15, 1.65, 0.1),
+        (-0.75, 1.20, -0.05), (-0.15, 1.20, -0.05), (-0.15, 1.20, 0.05), (-0.75, 1.20, 0.05),
+        (-0.75, 1.35, -0.05), (-0.15, 1.35, -0.05), (-0.15, 1.35, 0.05), (-0.75, 1.35, 0.05),
+        (0.15, 1.20, -0.05), (0.75, 1.20, -0.05), (0.75, 1.20, 0.05), (0.15, 1.20, 0.05),
+        (0.15, 1.35, -0.05), (0.75, 1.35, -0.05), (0.75, 1.35, 0.05), (0.15, 1.35, 0.05),
+    ]
+    faces = [
+        (1, 2, 6, 5), (2, 3, 7, 6), (3, 4, 8, 7), (4, 1, 5, 8), (1, 4, 3, 2), (5, 6, 7, 8),
+        (9, 10, 14, 13), (10, 11, 15, 14), (11, 12, 16, 15), (12, 9, 13, 16), (9, 12, 11, 10), (13, 14, 15, 16),
+        (17, 18, 22, 21), (18, 19, 23, 22), (19, 20, 24, 23), (20, 17, 21, 24), (17, 20, 19, 18), (21, 22, 23, 24),
+    ]
+    obj_lines = [f"v {x} {y} {z}\n" for x, y, z in verts]
+    obj_lines += ["f " + " ".join(map(str, f)) + "\n" for f in faces]
+    path.write_text("".join(obj_lines))
+    return path
+
+
+def test_mesh_fit_pose_safe_and_monotonicity(sheet_path, tmp_path):
+    """Verify mesh_fit on armed humanoid mesh does not degrade score and monotonicity guard holds."""
+    height_cm = 165.0
+    res_create = server.project_create(sheet_path=str(sheet_path), name="Armed Fit", height_cm=height_cm)
+    pid = res_create["project_id"]
+    server.sheet_split(project_id=pid)
+
+    armed = _create_armed_mesh(tmp_path / "armed.obj")
+    res_score1 = server.score_mesh(project_id=pid, mesh_path=str(armed))
+    assert res_score1["ok"] is True
+    total_before = res_score1["data"]["total"]
+    mesh_path1 = res_score1["data"]["best"]["mesh"]
+
+    res_fit = tools_core.mesh_fit(project_id=pid, mesh_path=mesh_path1)
+    assert res_fit["ok"] is True
+    fit_path = res_fit["data"]["mesh_path"]
+
+    res_score2 = server.score_mesh(project_id=pid, mesh_path=fit_path)
+    total_after = res_score2["data"]["total"]
+
+    assert total_after >= total_before - 1e-4
+
+

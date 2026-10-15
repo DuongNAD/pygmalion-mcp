@@ -13,15 +13,15 @@ You orchestrate tools. You never write Blender code and never edit files under p
 4. `score_mesh(project_id, mesh_path)`. Read `data.passed`, `data.iou`, `data.hints`.
    If a warning says the mesh is turned 90 degrees, re-score with `rotate_z=90`.
 5. Not passed: follow `next_action` (`mesh_fit`, or `generate_mesh` for a new candidate). Score again after every change.
-6. `stage` is `passed` or `stopped`: `mesh_optimize` -> `mesh_export` (-> `auto_rig` at Level 3).
+6. `stage` is `passed` or `stopped`: `mesh_optimize` -> `mesh_export` (-> `auto_rig` -> `animate` at Level 3).
    `stopped` still ships the best mesh found; that is expected, not a failure.
-7. Done when `next_action` is null. Final report: output files, best total, passed, stop_reason, stats from `project_status`.
+7. Done when `next_action` is null. Final report: output files (including rigged and animated GLBs), best total, passed, stop_reason, stats from `project_status`.
 
-Level 3 shortcut: `pipeline_run(project_id)` runs steps 2-7 itself. Call it again while `data.status == "running"`.
+Level 3 shortcut: `pipeline_run(project_id, rig=True, animate=True)` runs steps 2-7 itself. Call it again while `data.status == "running"`.
 Only intervene with single tools when it returns an error or `data.status == "blocked"`.
 
 ## Rules
-- `next_action` is the default plan. Deviate only to follow `error.fix`.
+- `next_action` is the default plan (`auto_rig` advances to `animate`, and `animate` finishes with `null`). Deviate only to follow `error.fix`.
 - `ok == false`: do exactly what `error.fix` says. The same error code twice in a row: stop and report it.
 - Decide with numbers (`passed`, `iou`, `total`). Images (preview, diffs, compare) are only for locating problems.
 - Copy paths from tool results. Never invent paths or project ids.

@@ -34,6 +34,7 @@ def parse():
     ap.add_argument("--rotate-z", type=float, default=0.0)
     ap.add_argument("--scale-x", required=True)
     ap.add_argument("--scale-y", required=True)
+    ap.add_argument("--damp-arms", action="store_true", default=False)
     return ap.parse_args(sys.argv[sys.argv.index("--") + 1:])
 
 
@@ -125,6 +126,12 @@ def main():
         # Deform control points
         sx = [float(x) for x in args.scale_x.split(",")]
         sy = [float(y) for y in args.scale_y.split(",")]
+
+        if getattr(args, "damp_arms", False):
+            # Arm height bands: w in [7, 13]
+            for w in range(7, 14):
+                if w < len(sx):
+                    sx[w] = 1.0 + (sx[w] - 1.0) * 0.20
 
         # In Blender lattice: w=0 is Z bottom (-0.5), w=15 is Z top (+0.5)
         for i, pt in enumerate(lat_data.points):
