@@ -1,13 +1,14 @@
-"""Multi-action animation generation and GLB merging script.
+"""Multi-action animation generation, renaming, and GLB merging script.
 Runs INSIDE Blender: bpy/mathutils/stdlib only.
 
 Protocol:
-blender -b --factory-startup --python-exit-code 1 -P merge_animations.py -- --result <result_json> [--mesh <path>] [--out <path>] [--actions <comma_separated>] [--mode <procedural|merge>] [--clips <comma_separated>]
+blender -b --factory-startup --python-exit-code 1 -P merge_animations.py -- --result <result_json> [--mesh <path>] [--out <path>] [--actions <comma_separated>] [--mode <procedural|merge|rename>] [--clips <comma_separated>]
 """
 import argparse
 import json
 import math
 import os
+import struct
 import sys
 
 import bpy
@@ -46,7 +47,7 @@ def parse_args():
     ap.add_argument("--mesh", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--actions", default="idle,walk,wave")
-    ap.add_argument("--mode", default="procedural", choices=["procedural", "merge"])
+    ap.add_argument("--mode", default="procedural", choices=["procedural", "merge", "rename"])
     ap.add_argument("--clips", default="")
     return ap.parse_args(sys.argv[sys.argv.index("--") + 1:])
 
@@ -339,6 +340,57 @@ def run_merge(args, action_names):
         raise RuntimeError(f"Exported merged GLB is missing or empty: {args.out}")
 
 
+def run_rename(args, action_names):
+    """Rename animation tracks inside a multi-action GLB (e.g. from Meshy action_ids) to match requested action_names."""
+    src_file = args.mesh if (args.mesh and os.path.isfile(args.mesh)) else args.out
+    if not src_file or not os.path.isfile(src_file):
+        raise RuntimeError(f"Source GLB for rename not found: {src_file}")
+
+    with open(src_file, "rb") as f:
+        glb_bytes = f.read()
+
+    if len(glb_bytes) < 20:
+        raise RuntimeError("Invalid GLB: file too small")
+    magic, version, _ = struct.unpack("<4sII", glb_bytes[:12])
+    if magic != b"glTF" or version != 2:
+        raise RuntimeError(f"Invalid GLB header: magic={magic!r}, version={version}")
+
+    chunk0_len, chunk0_type = struct.unpack("<I4s", glb_bytes[12:20])
+    if chunk0_type != b"JSON":
+        raise RuntimeError(f"Expected JSON chunk 0, got {chunk0_type!r}")
+
+    json_str = glb_bytes[20 : 20 + chunk0_len].decode("utf-8")
+    gltf_obj = json.loads(json_str)
+    anims = gltf_obj.get("animations") or []
+    if not anims:
+        raise RuntimeError("GLB contains no animation tracks to rename.")
+
+    new_anims = []
+    for i, target_name in enumerate(action_names):
+        src_anim = anims[i] if i < len(anims) else anims[-1]
+        anim_copy = dict(src_anim)
+        anim_copy["name"] = target_name
+        new_anims.append(anim_copy)
+    gltf_obj["animations"] = new_anims
+
+    new_json_bytes = json.dumps(gltf_obj, ensure_ascii=False).encode("utf-8")
+    padding = (4 - (len(new_json_bytes) % 4)) % 4
+    new_json_bytes += b" " * padding
+
+    rest = glb_bytes[20 + chunk0_len :]
+    total_len = 12 + 8 + len(new_json_bytes) + len(rest)
+    new_glb = (
+        struct.pack("<4sII", b"glTF", 2, total_len)
+        + struct.pack("<I4s", len(new_json_bytes), b"JSON")
+        + new_json_bytes
+        + rest
+    )
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "wb") as f:
+        f.write(new_glb)
+
+
 def main():
     args = parse_args()
     action_names = [a.strip() for a in args.actions.split(",") if a.strip()]
@@ -346,7 +398,9 @@ def main():
         action_names = ["idle", "walk", "wave"]
 
     try:
-        if args.mode == "merge":
+        if args.mode == "rename":
+            run_rename(args, action_names)
+        elif args.mode == "merge":
             run_merge(args, action_names)
         else:
             run_procedural(args, action_names)

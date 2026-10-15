@@ -41,7 +41,15 @@ class TripoProvider(Provider):
         return str(token)
 
     def submit_multiview(self, inputs: dict[str, Any], seed: int | None = None) -> str:
-        """Submit multi-view task to POST /v2/openapi/task with directional inputs."""
+        """Submit multi-view task to POST /v2/openapi/task with directional inputs.
+
+        TODO(tripo-v2-files): Tripo H-series / v3.1 docs specify `files` as a 4-item ordered list
+        `[front, left, back, right]` (with `{}` for omitted views), whereas earlier v2 specs and
+        existing contract tests expect `inputs` as a directional dict `{front, left, back, right}`.
+        Additionally, official Tripo docs do not disambiguate whether `left` means camera on the
+        character's left (+X) or character facing left in image space. Verify against a live Tripo
+        task before switching from `inputs` to `files`.
+        """
         key = self._require_key()
         formatted_inputs: dict[str, dict[str, str]] = {}
         for k, v in inputs.items():

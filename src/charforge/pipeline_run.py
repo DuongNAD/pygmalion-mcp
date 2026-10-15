@@ -108,6 +108,7 @@ def pipeline_run(
 
         # Step succeeded: format concise summary
         data = res.get("data") or {}
+        status_val = data.get("status")
         if tool_name == "sheet_split":
             conf = data.get("confidence", 1.0)
             summary = f"Split turnaround sheet (confidence: {conf:.2f})"
@@ -118,17 +119,9 @@ def pipeline_run(
                 warnings.append(f"Sheet split confidence {conf:.2f} < 0.8 requires user confirmation.")
                 break
         elif tool_name == "generate_mesh":
-            status_val = data.get("status")
             prov = data.get("provider", "unknown")
             m_path = data.get("mesh_path")
             summary = f"Generated mesh via {prov}: {m_path}" if status_val == "done" else f"Generation in progress via {prov}"
-            if status_val == "running":
-                steps.append({"tool": tool_name, "ok": True, "summary": summary})
-                # If cloud job running, reload state and poll on next iteration
-                next_act = res.get("next_action")
-                p = state.load(project_id)
-                time.sleep(1.0)
-                continue
         elif tool_name == "score_mesh":
             tot = data.get("total", 0.0)
             passed = data.get("passed", False)
@@ -142,13 +135,29 @@ def pipeline_run(
         elif tool_name == "mesh_export":
             summary = f"Exported files: {list(data.get('files', {}).keys())}"
         elif tool_name == "auto_rig":
-            summary = f"Rigged model with {data.get('bones')} bones: {data.get('mesh_path')}"
+            summary = (
+                f"Rigging in progress ({data.get('job_id')})"
+                if status_val == "running"
+                else f"Rigged model with {data.get('bones')} bones: {data.get('mesh_path')}"
+            )
         elif tool_name == "animate":
-            summary = f"Animated model ({data.get('clip_count')} clips): {data.get('mesh_path')}"
+            summary = (
+                f"Animation in progress ({data.get('job_id')})"
+                if status_val == "running"
+                else f"Animated model ({data.get('clip_count')} clips): {data.get('mesh_path')}"
+            )
         else:
             summary = f"Completed {tool_name}"
 
         steps.append({"tool": tool_name, "ok": True, "summary": summary})
+
+        if status_val == "running":
+            # Cloud job in progress: reload state and poll on next iteration
+            next_act = res.get("next_action")
+            p = state.load(project_id)
+            rem = max(0.0, max_seconds - (time.time() - t0))
+            time.sleep(min(0.2, rem))
+            continue
 
         # Reload state
         p = state.load(project_id)
