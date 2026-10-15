@@ -38,6 +38,24 @@ CANON_SIZE = 512  # canonical mask canvas, px
 PROFILE_BINS = 64  # horizontal bands in width profiles
 
 PROVIDER_KEYS = {"tripo": "TRIPO_API_KEY", "meshy": "MESHY_API_KEY", "rodin": "RODIN_API_KEY", "hunyuan": "FAL_KEY"}
+PROVIDER_SOURCES = {"meshy", "tripo", "rodin", "hunyuan"}
+PROVIDER_ACCEPT_TOTAL = 0.80  # min weighted silhouette total for cloud provider meshes
+MAX_PROVIDER_TRIS = 300000  # max face/triangle budget accepted by Meshy rigging
+
+# --- Meshy API tunables ---
+MESHY_AI_MODEL = "meshy-7.1"
+MESHY_TARGET_POLYCOUNT = 30000
+MESHY_TEXTURE_FROM_VIEWS = True
+MESHY_LIBRARY_TTL_SECONDS = 7 * 24 * 3600  # 7 days cache TTL for /openapi/v1/animations/library
+MESHY_ACTION_ALIASES: dict[str, list[str]] = {
+    "idle": ["Idle", "Breathing_Idle", "Happy_Idle", "Standing_Idle", "Alert_Idle"],
+    "walk": ["Walking", "Casual_Walk", "Walk", "Walk_Forward", "Walking_Woman"],
+    "wave": ["Waving", "Wave", "Waving_Gesture", "Hello", "Standing_Greeting"],
+    "run": ["Running", "Run", "Run_Forward", "Fast_Run"],
+    "jump": ["Jump", "Jumping", "Happy_Jump"],
+    "attack": ["Attack", "Double_Combo_Attack", "Slash", "Punch"],
+    "dance": ["Dancing", "Hip_Hop_Dancing", "Samba_Dancing", "Dance"],
+}
 
 
 def home() -> Path:

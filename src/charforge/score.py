@@ -114,12 +114,20 @@ def contact_sheet(rows: list[list[Path | str]], out: Path, height: int = 384) ->
     return out
 
 
-def compare(ref: dict[str, np.ndarray], ren: dict[str, np.ndarray], weights: dict, thresholds: dict, neck_ratio: float = 0.15) -> dict:
+def compare(
+    ref: dict[str, np.ndarray],
+    ren: dict[str, np.ndarray],
+    weights: dict,
+    thresholds: dict,
+    neck_ratio: float = 0.15,
+    provider_mesh: bool = False,
+) -> dict:
     """[L1-T3] ref/ren: {view: raw bool mask}. Returns
     {"iou": {view: float}, "total": float, "passed": bool, "side_mirrored": bool, "rotated_90": bool,
      "aspect_delta": {view: float}, "worst_bands": [{"view", "from", "to", "region", "delta"}], "hints": [str]}
     - canonicalize both; side IoU = max(IoU(ref, ren), IoU(ref, fliplr(ren))), side_mirrored = flipped won.
-    - total = sum(weights[v] * iou[v]); passed = all(iou[v] >= thresholds[v]); round floats to 4 places.
+    - total = sum(weights[v] * iou[v]); passed = (total >= PROVIDER_ACCEPT_TOTAL) for provider meshes,
+      else all(iou[v] >= thresholds[v]); round floats to 4 places.
     - worst_bands: width_profile delta (ren - ref) per bin; merge adjacent bins with the same sign and |delta| > 0.02;
       keep the top 3 by summed |delta|; from/to = % of height from the top; region by band center:
       < neck_ratio "head", < 0.45 "torso", < 0.60 "hips/skirt", else "legs"; delta = mean delta.
@@ -145,7 +153,10 @@ def compare(ref: dict[str, np.ndarray], ren: dict[str, np.ndarray], weights: dic
     }
 
     total = round(sum(weights[v] * ious[v] for v in ("front", "side", "back")), 4)
-    passed = bool(all(ious[v] >= thresholds[v] for v in ("front", "side", "back")))
+    if provider_mesh:
+        passed = bool(total >= config.PROVIDER_ACCEPT_TOTAL)
+    else:
+        passed = bool(all(ious[v] >= thresholds[v] for v in ("front", "side", "back")))
     rotated_90 = bool(iou(c_ref["side"], c_ren["front"]) > iou(c_ref["front"], c_ren["front"]) + 0.05)
 
     def _aspect(m: np.ndarray) -> float:

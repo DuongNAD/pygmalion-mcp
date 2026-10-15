@@ -112,17 +112,26 @@ def score_mesh(project_id: ProjectId, mesh_path: MeshPath, rotate_z: RotateZ = 0
     if not p["views"]:
         raise CFError("VIEWS_MISSING", "Reference views are not extracted yet.", "Call sheet_split first.", action("sheet_split", "Needed before scoring.", project_id=project_id))
     mesh, rpath = state.mesh_path(p, mesh_path)
+    is_prov = state.is_provider_mesh(p, rpath)
     out = state.render_dir(p, rpath)
     r = blender.run("render_views.py", {"mesh": mesh, "out": out, "mode": "mask", "rotate_z": rotate_z})
     pdir = state.project_dir(project_id)
     ref = {v: score.load_mask(pdir / p["views"][v]["mask"]) for v in state.VIEWS}
     ren = {v: score.load_mask(r["files"][v]) for v in state.VIEWS}
-    res = score.compare(ref, ren, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15))
+    res = score.compare(ref, ren, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15), provider_mesh=is_prov)
+    warnings: list[str] = []
+    max_tris = p.get("max_provider_tris", config.MAX_PROVIDER_TRIS)
+    if is_prov and r["tris"] > max_tris:
+        res["passed"] = False
+        res["over_poly_budget"] = True
+        warnings.append(f"Provider mesh has {r['tris']} triangles (exceeds max {max_tris}); regenerate with smaller target_polycount.")
+    if res.get("rotated_90") and rotate_z == 0:
+        res["passed"] = False
     diffs = {v: state.rel(p, f) for v, f in score.write_diffs(ref, ren, out).items()}
     next(m for m in p["meshes"] if m["path"] == rpath)["rotate_z"] = rotate_z
     state.record_score(p, {"mesh": rpath, "rotate_z": rotate_z, "tris": r["tris"], **res})
     state.save(p)
-    warnings, nxt = [], state.suggest_next(p)
+    nxt = state.suggest_next(p)
     if res.get("rotated_90") and rotate_z == 0:
         warnings.append("Mesh seems turned 90 degrees.")
         nxt = action("score_mesh", "Re-score with the mesh turned 90 degrees.", project_id=project_id, mesh_path=rpath, rotate_z=90)

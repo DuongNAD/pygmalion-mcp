@@ -12,8 +12,9 @@ You orchestrate tools. You never write Blender code and never edit files under p
    - Level 1: use the mesh file you were given.
 4. `score_mesh(project_id, mesh_path)`. Read `data.passed`, `data.iou`, `data.hints`.
    If a warning says the mesh is turned 90 degrees, re-score with `rotate_z=90`.
-5. Not passed: follow `next_action` (`mesh_fit`, or `generate_mesh` for a new candidate). Score again after every change.
-6. `stage` is `passed` or `stopped`: `mesh_optimize` -> `mesh_export` (-> `auto_rig` -> `animate` at Level 3).
+5. Not passed: follow `next_action` (`generate_mesh` for provider meshes or `mesh_fit` / `generate_mesh` for blockout meshes). Score again after every change.
+6. `stage` is `passed` or `stopped`: follow `next_action`. Provider meshes skip `mesh_fit` and `mesh_optimize` to preserve UVs/PBR textures and go directly to `mesh_export` -> `auto_rig` -> `animate`. Blockout meshes run `mesh_optimize` -> `mesh_export` -> `auto_rig` -> `animate`.
+   While `auto_rig` or `animate` returns `data.status == "running"`, call the same tool again with the returned `job_id`.
    `stopped` still ships the best mesh found; that is expected, not a failure.
 7. Done when `next_action` is null. Final report: output files (including rigged and animated GLBs), best total, passed, stop_reason, stats from `project_status`.
 
