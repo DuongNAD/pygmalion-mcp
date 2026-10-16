@@ -56,6 +56,13 @@ Toàn bộ quy trình từ ảnh turnaround 2D phẳng đến model 3D rigged & 
   `project_create → sheet_split → generate_mesh → score_mesh ⇄ mesh_fit → mesh_optimize → mesh_export → auto_rig → animate`.
 - Job cloud đang chạy được poll lại mỗi 5 s (tránh bị giới hạn tốc độ); cảnh báo QA của từng bước được gom vào kết quả.
 
+### Kiểm toàn vẹn mesh và critic thị giác độc lập (`score_mesh`, `animate`)
+- **Toàn vẹn hình học** (luôn chạy, chỉ bằng số): đếm mảnh vụn, phần bị tách khỏi thân, lỗ hở, cạnh non-manifold và bề mặt tự cắt. Mesh có phần bị tách hoặc tự cắt nhiều sẽ xếp sau mesh lành trong số các mesh đã passed.
+- **Critic thị giác** (tùy chọn): Claude so ảnh sheet với ảnh render màu theo rubric cố định gồm mặt, texture, chi tiết, giải phẫu và lỗi hình học, rồi chấm điểm 0–10 kèm lỗi cụ thể. Với animation, critic soi contact sheet từng clip để tìm tư thế gượng, xuyên vật thể và biến dạng.
+  - Model điều phối không bao giờ tự chấm sản phẩm của mình.
+  - Critic chỉ tư vấn: không đổi `passed`, chỉ chọn giữa hai mesh đã passed khi chênh từ 1 điểm trở lên, và đưa ra cảnh báo.
+  - Cài: `pip install -e ".[critic]"`, đặt `ANTHROPIC_API_KEY`, rồi tùy chọn đặt `CHARFORGE_CRITIC=auto|on|off`. Mặc định dùng `claude-opus-5-5` với fallback phía server `"default"`, tối đa 6 lượt gọi mỗi project. Khi bật, ảnh sheet và ảnh render được gửi tới Claude API.
+
 ### Khe hở tư thế (A-pose) quan trọng ngang code
 `sheet_split` và `score_mesh` đo khe hở giữa cẳng tay/bàn tay với thân và giữa hai ống chân trên silhouette front. Tay sát thân hoặc hai đùi dính nhau là nguyên nhân chính khiến trọng số rò ("dính" khi chạy animation). Sheet dính → cảnh báo sớm. Sheet tách rời mà mesh Meshy lại dính → pipeline sinh thêm một ứng viên và ưu tiên mesh không dính.
 

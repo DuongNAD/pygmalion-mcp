@@ -16,7 +16,7 @@ except (ImportError, ModuleNotFoundError):
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import blender, config, score, sheet, state
+from . import blender, config, critic, score, sheet, state
 from .envelope import CFError, action, ok, tool_entry
 
 PLAYBOOK = Path(__file__).with_name("playbook.md").read_text()
@@ -58,7 +58,7 @@ def project_status(project_id: ProjectId) -> dict:
     p = state.load(project_id)
     data = {k: p[k] for k in ("stage", "name", "height_cm", "views", "meshes", "best", "outputs", "stop_reason")}
     data["scores"] = [{k: s.get(k) for k in ("mesh", "total", "passed", "iou")} for s in p["scores"][-5:]]
-    data["qa"] = p.get("qa") or {}
+    data["qa"] = {**(p.get("qa") or {}), "critic_calls": p.get("critic_calls", 0)}
     data["animations"] = p.get("animations") or []
     data["stats"] = state.stats(project_id)
     return ok(data, project_id, state.suggest_next(p))
@@ -110,17 +110,45 @@ def render_views(
     return ok(data, project_id, state.suggest_next(p))
 
 
+def _mesh_critic(p: dict, pdir: Path, mesh: Path, rotate_z: int, out: Path) -> tuple[dict, list[str]]:
+    """Independent visual critic on a passed provider mesh: reference | color render per view, fixed rubric.
+    Advisory only; skipped silently in auto mode when no SDK/credentials, reported when it fails."""
+    try:
+        critic.check(p)
+    except critic.CriticUnavailable as e:
+        return {"skipped": str(e)}, ([f"Visual critic skipped: {e}"] if critic.settings(p)["mode"] == "on" else [])
+    try:
+        r = blender.run("render_views.py", {"mesh": mesh, "out": out, "mode": "color", "rotate_z": rotate_z})
+        rows = [[pdir / p["views"][v]["image"], r["files"][v]] for v in state.VIEWS]
+        sheet = score.contact_sheet(rows, out / "compare_color.png")
+        res = critic.critique_mesh(p, sheet)
+    except (critic.CriticFailed, critic.CriticUnavailable, CFError) as e:
+        return {"error": str(getattr(e, "message", e))}, [f"Visual critic failed: {getattr(e, 'message', e)}"]
+    res["compare"] = state.rel(p, sheet)
+    warnings = []
+    if res["overall"] < critic.settings(p)["warn_below"]:
+        warnings.append(f"Visual critic: {res['overall']}/10 against the sheet; " + "; ".join(res["issues"][:3]))
+    return res, warnings
+
+
 @mcp.tool(annotations=LOCAL_WRITE)
 @tool_entry
 def score_mesh(project_id: ProjectId, mesh_path: MeshPath, rotate_z: RotateZ = 0) -> dict:
-    """Score a mesh against the reference: silhouette IoU per view, total, passed, proportion hints, diff images."""
+    """Score a mesh against the reference: silhouette IoU per view, total, passed, proportion hints, diff images,
+    geometry integrity (floating parts, holes, self-intersections) and, for passed provider meshes, an
+    independent visual critic (advisory)."""
     p = state.load(project_id)
     if not p["views"]:
         raise CFError("VIEWS_MISSING", "Reference views are not extracted yet.", "Call sheet_split first.", action("sheet_split", "Needed before scoring.", project_id=project_id))
     mesh, rpath = state.mesh_path(p, mesh_path)
     is_prov = state.is_provider_mesh(p, rpath)
     out = state.render_dir(p, rpath)
-    r = blender.run("render_views.py", {"mesh": mesh, "out": out, "mode": "mask", "rotate_z": rotate_z})
+    icfg = state.tunables(p, "integrity_thresholds", config.INTEGRITY)
+    r = blender.run(
+        "render_views.py",
+        {"mesh": mesh, "out": out, "mode": "mask", "rotate_z": rotate_z, "integrity": True,
+         "gap_frac": icfg["gap_frac"], "debris_share": icfg["debris_share"]},
+    )
     pdir = state.project_dir(project_id)
     ref = {v: score.load_mask(pdir / p["views"][v]["mask"]) for v in state.VIEWS}
     ren = {v: score.load_mask(r["files"][v]) for v in state.VIEWS}
@@ -140,6 +168,13 @@ def score_mesh(project_id: ProjectId, mesh_path: MeshPath, rotate_z: RotateZ = 0
             warnings.append(
                 f"Mesh fuses the {' and '.join(res['pose_mismatch'])} that the sheet keeps apart: rig weights will bleed there."
             )
+    integ = score.integrity_report(r.get("integrity"), icfg)
+    if integ is not None:
+        res["integrity"] = integ
+        warnings += [f"Mesh integrity: {i}" for i in integ["issues"]]
+    if is_prov and res["passed"]:
+        res["critic"], w = _mesh_critic(p, pdir, mesh, rotate_z, out)
+        warnings += w
     diffs = {v: state.rel(p, f) for v, f in score.write_diffs(ref, ren, out).items()}
     next(m for m in p["meshes"] if m["path"] == rpath)["rotate_z"] = rotate_z
     state.record_score(p, {"mesh": rpath, "rotate_z": rotate_z, "tris": r["tris"], **res})

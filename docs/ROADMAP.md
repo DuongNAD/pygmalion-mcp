@@ -71,6 +71,8 @@ Mỗi card có thể giao cho bất kỳ coding agent nào. Card viết bằng t
 
 **L3-T4 — Rig/animation QA (đã làm)**: `pose_deformation_check` cho mọi rig (`bpy_scripts/rig_check.py`, `cf_humanoid.py`), tự sửa trọng số rig provider, `export/<id>-humanoid.json`; preview front/side + `motion_check` cho mọi clip (`preview_clips.py`); khe hở tư thế ở `sheet_split`/`score_mesh` và policy sinh thêm một ứng viên khi mesh dính; Text to Motion (`animate(motions=…)`); spring bone tóc/váy bake vào clip (`cf_secondary.py`); procedural theo vai trò xương. Test: `tests/test_rig_qa.py`, `tests/test_anim_qa.py`, `tests/test_pose_gaps.py`, `tests/contract/test_text_to_motion_contract.py`.
 
+**L3-T5 — Toàn vẹn mesh + critic thị giác (đã làm)**: `render_views.py --integrity` (mảnh rời, phần bị tách, lỗ hở, non-manifold, tự cắt) và `critic.py` (Claude chấm sheet | render và contact sheet clip theo rubric cố định, chỉ tư vấn, có ngân sách). Test: `tests/test_integrity.py`, `tests/test_critic.py`.
+
 ---
 ## Sau roadmap (tùy chọn)
-VLM judge cho mặt và chi tiết; chiếu texture từ reference lên mesh (bake); rig mặt / ARKit 52 blendshapes (cần mesh có mặt mô hình hóa); tách lớp tóc và váy thành mesh riêng + cloth sim thật; retarget tự động sang skeleton Mixamo T-pose.
+Critic soi riêng vùng mặt ở độ phân giải cao; chiếu texture từ reference lên mesh (bake); rig mặt / ARKit 52 blendshapes (cần mesh có mặt mô hình hóa); tách lớp tóc và váy thành mesh riêng + cloth sim thật; retarget tự động sang skeleton Mixamo T-pose.

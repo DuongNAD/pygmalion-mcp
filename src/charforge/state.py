@@ -240,11 +240,39 @@ def render_dir(p: dict, rpath: str) -> Path:
     return out
 
 
-def _rank(rec: dict) -> tuple:
-    """Best-mesh order: passed first; among passed meshes a clean pose (no arms/legs fused that the sheet
-    keeps apart) beats a few hundredths of silhouette IoU, because fused parts ruin the rig."""
-    passed = bool(rec.get("passed"))
-    return (passed, not rec.get("pose_mismatch") if passed else True, rec.get("total", 0.0))
+def tunables(p: dict, key: str, defaults: dict) -> dict:
+    """config defaults overridden per project by project.json[key]."""
+    return {**defaults, **(p.get(key) or {})}
+
+
+def _gate(rec: dict) -> tuple:
+    """Hard order between meshes: passed first; among passed ones a clean pose (no arms/legs fused that the
+    sheet keeps apart) and sound geometry (no detached parts) beat silhouette IoU, because both ruin the rig."""
+    if not rec.get("passed"):
+        return (False, True, True)
+    integ = rec.get("integrity") or {}
+    integrity_ok = rec.get("integrity_ok", integ.get("ok", True)) is not False
+    return (True, not rec.get("pose_mismatch"), integrity_ok)
+
+
+def _critic_overall(rec: dict) -> float | None:
+    c = rec.get("critic")
+    if isinstance(c, dict) and c.get("overall") is not None:
+        return float(c["overall"])
+    return rec.get("critic_overall")
+
+
+def _better(p: dict, rec: dict, best: dict) -> bool:
+    """rec beats best? Gate first; then, between passed meshes the visual critic decides when it differs by at
+    least CRITIC.min_delta points (both graded); otherwise the silhouette total."""
+    ga, gb = _gate(rec), _gate(best)
+    if ga != gb:
+        return ga > gb
+    if ga[0]:
+        ca, cb = _critic_overall(rec), _critic_overall(best)
+        if ca is not None and cb is not None and abs(ca - cb) >= tunables(p, "critic_params", config.CRITIC)["min_delta"]:
+            return ca > cb
+    return rec.get("total", 0.0) > best.get("total", 0.0)
 
 
 def record_score(p: dict, rec: dict) -> None:
@@ -252,10 +280,14 @@ def record_score(p: dict, rec: dict) -> None:
     p["scores"].append({**rec, "at": _now()})
     if p["stage"] not in SEARCH_STAGES:
         return  # post-search check (e.g. after optimize): record only
-    if not p["best"] or _rank(rec) > _rank(p["best"]):
+    if not p["best"] or _better(p, rec, p["best"]):
         p["best"] = {"mesh": rec["mesh"], "total": rec["total"], "passed": rec["passed"]}
         if rec.get("pose_mismatch"):
             p["best"]["pose_mismatch"] = rec["pose_mismatch"]
+        if (rec.get("integrity") or {}).get("ok") is not None:
+            p["best"]["integrity_ok"] = rec["integrity"]["ok"]
+        if _critic_overall(rec) is not None:
+            p["best"]["critic_overall"] = _critic_overall(rec)
 
     # If mesh appears turned 90 degrees and hasn't been rotated yet, stay in 'scored' for re-scoring
     if rec.get("rotated_90") and rec.get("rotate_z", 0) == 0:

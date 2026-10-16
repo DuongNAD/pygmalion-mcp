@@ -31,7 +31,7 @@ except (ImportError, ModuleNotFoundError):
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from . import blender, config, providers, score, state
+from . import blender, config, critic, providers, score, state
 from .envelope import CFError, action, ok, tool_entry
 from .pipeline_run import pipeline_run
 
@@ -162,10 +162,6 @@ def reorder_glb_animations(glb_path: Path, names: list[str]) -> None:
 
 # ---------------------------------------------------------------- rig QA
 
-def _tunables(p: dict, key: str, defaults: dict) -> dict:
-    return {**defaults, **(p.get(key) or {})}
-
-
 def _summarize_rig_qa(r: dict) -> dict:
     """Compact rig QA for tool results and project.json; the full report is in renders/qa/rig_check.json."""
     final = (r.get("after") if r.get("repaired") else r.get("before")) or {}
@@ -235,7 +231,7 @@ def _provider_rig_qa(p: dict, pdir: Path, project_id: str, rig_rpath: str) -> tu
         return qa, _rig_qa_warnings(qa)
     fixed = pdir / "meshes" / f"{project_id}-rigged-fixed.glb"
     humanoid_rpath = f"export/{project_id}-humanoid.json"
-    args = {"mesh": rig_path, "repair": True, "out": fixed, "humanoid": pdir / humanoid_rpath, **_tunables(p, "rig_check_thresholds", config.RIG_CHECK)}
+    args = {"mesh": rig_path, "repair": True, "out": fixed, "humanoid": pdir / humanoid_rpath, **state.tunables(p, "rig_check_thresholds", config.RIG_CHECK)}
     try:
         r = blender.run("rig_check.py", args)
     except CFError as e:
@@ -544,7 +540,7 @@ def auto_rig(
         "out": out_path,
         "neck_ratio": neck_ratio,
         "humanoid": pdir / humanoid_rpath,
-        **_tunables(p, "rig_check_thresholds", config.RIG_CHECK),
+        **state.tunables(p, "rig_check_thresholds", config.RIG_CHECK),
     }
     if ref_path.is_file():
         args["ref_json"] = ref_path
@@ -638,7 +634,7 @@ def _post_animation(
 
 
 def _secondary_args(p: dict) -> dict:
-    s = _tunables(p, "secondary_params", config.SECONDARY)
+    s = state.tunables(p, "secondary_params", config.SECONDARY)
     return {k: s[k] for k in ("stiffness", "drag", "gravity", "skirt_chains", "max_hair_chains")}
 
 
@@ -651,14 +647,14 @@ def _clip_qa(p: dict, pdir: Path, anim_rpath: str) -> tuple[dict, dict, list[str
         return {}, mc, []
     out_dir = pdir / "renders" / "anim"
     frames_dir = out_dir / "frames"
-    cfg = _tunables(p, "anim_preview", config.ANIM_PREVIEW)
+    cfg = state.tunables(p, "anim_preview", config.ANIM_PREVIEW)
     try:
         r = blender.run("preview_clips.py", {"mesh": anim, "out": frames_dir, "frames": cfg["frames"], "res": cfg["res"], "views": cfg["views"]})
     except CFError as e:
         mc = {"passed": None, "clips": {}, "issues": [f"previews failed: {e.message}"]}
         p.setdefault("qa", {})["motion"] = mc
         return {}, mc, [f"Clip previews failed: {e.message}"]
-    th = _tunables(p, "anim_check_thresholds", config.ANIM_CHECK)
+    th = state.tunables(p, "anim_check_thresholds", config.ANIM_CHECK)
     previews, clips, issues = {}, {}, []
     for c in r.get("clips") or []:
         m = c["metrics"]
@@ -672,10 +668,29 @@ def _clip_qa(p: dict, pdir: Path, anim_rpath: str) -> tuple[dict, dict, list[str
             issues.append(f"{c['name']}: feet sink {m['ground_cm']} cm below the floor")
     shutil.rmtree(frames_dir, ignore_errors=True)
     mc = {"passed": not issues, "clips": clips, "issues": issues}
+    warnings = ["Motion QA: " + "; ".join(issues[:3])] if issues else []
+    if previews:
+        mc["critic"], w = _motion_critic(p, pdir, previews)
+        warnings += w
     p.setdefault("qa", {})["motion"] = mc
     p.setdefault("outputs", {})["previews"] = previews
-    warnings = ["Motion QA: " + "; ".join(issues[:3])] if issues else []
     return previews, mc, warnings
+
+
+def _motion_critic(p: dict, pdir: Path, previews: dict[str, str]) -> tuple[dict, list[str]]:
+    """Independent visual critic on the clip sheets (advisory: never changes motion_check.passed)."""
+    try:
+        res = critic.critique_motion(p, {name: pdir / path for name, path in previews.items()})
+    except critic.CriticUnavailable as e:
+        return {"skipped": str(e)}, ([f"Visual critic skipped: {e}"] if critic.settings(p)["mode"] == "on" else [])
+    except critic.CriticFailed as e:
+        return {"error": str(e)}, [f"Visual critic failed: {e}"]
+    low = critic.settings(p)["warn_below"]
+    warnings = [
+        f"Visual critic: {name} {c['overall']}/10; " + "; ".join(c["issues"][:2])
+        for name, c in res["clips"].items() if c["overall"] < low
+    ]
+    return res, warnings
 
 
 def _finalize_animation(

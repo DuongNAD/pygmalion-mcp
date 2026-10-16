@@ -188,6 +188,42 @@ def pose_mismatch(reference_pose: dict | None, mesh_pose: dict | None) -> list[s
     return out
 
 
+def integrity_report(raw: dict | None, cfg: dict | None = None) -> dict | None:
+    """Turn the raw geometry counts from render_views --integrity into {..., ok, issues}.
+    ok = no detached parts, few non-manifold edges and few self-intersecting faces (rig-breaking defects);
+    debris and holes are reported but do not fail it."""
+    if not raw:
+        return None
+    cfg = cfg or config.INTEGRITY
+    if raw.get("issues"):  # e.g. no geometry
+        return {**raw, "ok": False}
+    edges, faces = max(1, raw.get("edges", 0)), max(1, raw.get("faces", 0))
+    nm_ratio = raw.get("non_manifold_edges", 0) / edges
+    si_ratio = raw.get("self_intersecting_faces", 0) / faces
+    issues = []
+    if raw.get("detached_parts"):
+        issues.append(
+            f"{raw['detached_parts']} detached part(s) ({raw['detached_pct']}% of the mesh) float away from the body: "
+            "they will not follow the rig"
+        )
+    if raw.get("debris_parts"):
+        issues.append(f"{raw['debris_parts']} floating fragment(s) of debris ({raw['debris_pct']}% of the mesh)")
+    if nm_ratio > cfg["non_manifold_max"]:
+        issues.append(f"{100 * nm_ratio:.1f}% of edges are non-manifold (3+ faces or wire edges)")
+    if si_ratio > cfg["self_intersect_max"]:
+        issues.append(f"{100 * si_ratio:.1f}% of faces cut through other faces")
+    if raw.get("holes", 0) > cfg["holes_max"]:
+        issues.append(f"{raw['holes']} open holes in the surface")
+    ok = not raw.get("detached_parts") and nm_ratio <= cfg["non_manifold_max"] and si_ratio <= cfg["self_intersect_max"]
+    return {
+        **raw,
+        "non_manifold_ratio": round(nm_ratio, 5),
+        "self_intersection_ratio": round(si_ratio, 5),
+        "ok": bool(ok),
+        "issues": issues,
+    }
+
+
 def pose_warnings(pose: dict | None, subject: str = "sheet") -> list[str]:
     """Agent-facing warnings for touching parts in a front silhouette."""
     if not pose:

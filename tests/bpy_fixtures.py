@@ -128,6 +128,69 @@ with open(P["out"] + ".json", "w") as f:
     json.dump({"verts": len(body.data.vertices), "bones": len(arm_data.bones)}, f)
 '''
 
+_INTEGRITY_SCRIPT = r'''
+import bpy, bmesh, json, math, sys
+P = json.loads(sys.argv[sys.argv.index("--") + 1])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+# body: capped cylinder unioned with a sphere head -> one closed, manifold piece
+bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=0.15, depth=1.0, location=(0, 0, 0.5))
+body = bpy.context.active_object
+bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=0.3, location=(0, 0, 1.2))
+head = bpy.context.active_object
+mod = body.modifiers.new("union", "BOOLEAN")
+mod.operation, mod.object, mod.solver = "UNION", head, "EXACT"
+bpy.context.view_layer.objects.active = body
+bpy.ops.object.modifier_apply(modifier=mod.name)
+bpy.data.objects.remove(head, do_unlink=True)
+if P["holes"]:  # open the bottom cap
+    bm = bmesh.new()
+    bm.from_mesh(body.data)
+    bmesh.ops.delete(bm, geom=[f for f in bm.faces if all(v.co.z < 1e-4 for v in f.verts)], context="FACES_ONLY")
+    bm.to_mesh(body.data)
+    bm.free()
+parts = [body]
+if P["intersect"]:  # a tube bent past 360 deg folds through itself, sunk into the body so it is attached
+    bpy.ops.mesh.primitive_cylinder_add(vertices=16, radius=0.03, depth=0.9, location=(0, 0, 0.5))
+    tube = bpy.context.active_object
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.subdivide(number_cuts=30)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    bend = tube.modifiers.new("bend", "SIMPLE_DEFORM")
+    bend.deform_method, bend.angle = "BEND", math.radians(420)
+    bpy.ops.object.modifier_apply(modifier=bend.name)
+    parts.append(tube)
+if P["debris"]:
+    bpy.ops.mesh.primitive_cube_add(size=0.02, location=(0.8, 0.0, 1.6))
+    parts.append(bpy.context.active_object)
+if P["detached"]:
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=0.08, location=(0.6, 0, 0.9))
+    parts.append(bpy.context.active_object)
+bpy.ops.object.select_all(action="DESELECT")
+for o in parts:
+    o.select_set(True)
+bpy.context.view_layer.objects.active = parts[0]
+bpy.ops.object.join()
+bpy.ops.export_scene.gltf(filepath=P["out"], export_format="GLB")
+'''
+
+
+def make_integrity_mesh(out: Path, *, holes: bool = False, intersect: bool = False, debris: bool = False, detached: bool = False) -> Path:
+    """Body (sphere head touching a capped cylinder) exported as GLB, so UV seams split vertices, plus optional
+    defects: open cylinder ends, a second sphere cutting the head, a tiny far cube, a detached sphere 'hand'."""
+    exe = config.blender_exe()
+    if not exe:
+        raise RuntimeError("Blender not installed")
+    params = {"out": str(out), "holes": holes, "intersect": intersect, "debris": debris, "detached": detached}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [exe, "-b", "--factory-startup", "--python-exit-code", "1", "--python-expr", _INTEGRITY_SCRIPT, "--", json.dumps(params)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0 or not out.is_file():
+        raise RuntimeError(f"integrity fixture failed:\n{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}")
+    return out
+
+
 UE_NAMES = {
     "Hips": "pelvis", "Spine": "spine_01", "Spine1": "spine_02", "Spine2": "spine_03", "Neck": "neck_01", "Head": "head",
     "HeadTop_End": "head_end", "LeftShoulder": "clavicle_l", "LeftArm": "upperarm_l", "LeftForeArm": "lowerarm_l",

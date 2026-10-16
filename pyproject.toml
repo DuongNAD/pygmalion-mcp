@@ -18,6 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+critic = ["anthropic>=1.15"]  # independent visual critic (score_mesh / animate); off without it
 
 [project.scripts]
 charforge = "charforge.__main__:main"

@@ -43,6 +43,28 @@ POSE_ARM_BAND_MIN = 0.25  # share of the forearm band (55-80% of the arm length)
 POSE_LEG_BAND_MIN = 0.5  # share of the shin band (72-92% height) that must show two separate legs
 POSE_RETRY = 1  # extra provider candidates when the mesh fuses arms/legs the sheet keeps apart (0 = off)
 
+# --- mesh integrity (score_mesh): numbers before eyes; a passed mesh without detached parts ranks first ---
+INTEGRITY = {
+    "gap_frac": 0.006,  # a piece farther than this x mesh height from the body floats
+    "debris_share": 0.002,  # floating pieces below this share of the vertices are debris, larger ones detached parts
+    "self_intersect_max": 0.03,  # share of faces crossing other faces before it counts as a defect
+    "non_manifold_max": 0.005,  # share of edges shared by 3+ faces before it counts as a defect
+    "holes_max": 30,  # open boundary loops reported as an issue above this
+}
+
+# --- visual critic (advisory): an independent vision model grades renders against the sheet with a fixed rubric.
+# It never gates `passed`; it breaks ties between passed provider meshes and flags animation problems.
+CRITIC = {
+    "mode": "auto",  # auto = on when the anthropic SDK (pip install charforge[critic]) and credentials exist | on | off
+    "model": "claude-opus-5-5",
+    "effort": "medium",
+    "max_calls": 6,  # per project
+    "min_delta": 1.0,  # critic points (0-10) that outweigh silhouette total between two passed meshes
+    "warn_below": 6.0,  # overall or clip score below this -> warning
+    "max_image_px": 1568,  # images are downscaled to this long edge before upload
+    "mesh_weights": {"face": 0.25, "texture": 0.2, "details": 0.15, "anatomy": 0.25, "artifacts": 0.15},
+}
+
 PROVIDER_KEYS = {"tripo": "TRIPO_API_KEY", "meshy": "MESHY_API_KEY", "rodin": "RODIN_API_KEY", "hunyuan": "FAL_KEY"}
 PROVIDER_SOURCES = {"meshy", "tripo", "rodin", "hunyuan"}
 PROVIDER_ACCEPT_TOTAL = 0.80  # min weighted silhouette total for cloud provider meshes
@@ -133,6 +155,10 @@ def env_report() -> dict:
             deps[dist] = md.version(dist)
         except md.PackageNotFoundError:
             deps[dist] = None
+    try:
+        critic_sdk = md.version("anthropic")
+    except md.PackageNotFoundError:
+        critic_sdk = None
     return {
         "ok": bool(exe) and all(deps.values()),
         "blender": exe,
@@ -141,4 +167,10 @@ def env_report() -> dict:
         "level": level(),
         "providers": providers_available(),
         "deps": deps,
+        "critic": {
+            "mode": (os.environ.get("CHARFORGE_CRITIC") or CRITIC["mode"]).lower(),
+            "anthropic_sdk": critic_sdk,
+            "credentials": any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE"))
+            or (Path.home() / ".config" / "anthropic").is_dir(),
+        },
     }

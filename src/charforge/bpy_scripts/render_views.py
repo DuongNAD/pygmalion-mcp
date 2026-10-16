@@ -4,7 +4,9 @@ Conventions: Z-up, meters, character faces -Y (Blender's glTF import default).
   front: camera at -Y looking +Y | side: at +X looking -X | back: at +Y looking -Y
 mode=mask  -> Workbench, transparent film; the mask is the PNG alpha channel.
 mode=color -> Workbench flat light + texture/attribute colors (~albedo, comparable to flat anime art).
-Result JSON: {ok, files: {view: abs path}, dims_m: [x, y, z], tris, engine}
+--integrity -> also measure the geometry (see integrity()): floating parts, holes, non-manifold edges,
+               self-intersections, degenerate faces. Numbers only, no rendering involved.
+Result JSON: {ok, files: {view: abs path}, dims_m: [x, y, z], tris, engine, integrity?}
 """
 import argparse
 import json
@@ -12,8 +14,10 @@ import math
 import os
 import sys
 
+import bmesh
 import bpy
 from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 CAMS = {"front": ((0, -1, 0), (90, 0, 0)), "side": ((1, 0, 0), (90, 0, 90)), "back": ((0, 1, 0), (90, 0, 180))}
 
@@ -43,7 +47,131 @@ def parse():
     ap.add_argument("--mode", choices=["mask", "color"], default="mask")
     ap.add_argument("--res", type=int, default=1024)
     ap.add_argument("--rotate-z", type=float, default=0.0)
+    ap.add_argument("--integrity", action="store_true", default=False)
+    ap.add_argument("--gap-frac", type=float, default=0.006)
+    ap.add_argument("--debris-share", type=float, default=0.002)
     return ap.parse_args(sys.argv[sys.argv.index("--") + 1:])
+
+
+def integrity(meshes, gap_frac=0.006, debris_share=0.002):
+    """Geometry health of the evaluated meshes (world space), with UV-seam copies welded first:
+    components   connected pieces; a piece that neither cuts into nor comes within gap_frac x height of the
+                 surface of a piece chained to the largest one floats: < debris_share of the vertices = debris,
+                 larger = detached part
+    holes        open boundary loops; non_manifold edges shared by 3+ faces (or wire edges)
+    self_intersecting_faces  triangles cutting through another triangle of the same connected piece (a surface
+                             folding through itself); separate pieces passing through each other (eyes in a head,
+                             hair over a scalp) are counted apart as interpenetrating_faces
+    degenerate_faces         zero-area triangles"""
+    dg = bpy.context.evaluated_depsgraph_get()
+    shapes = {pb.custom_shape for o in bpy.context.scene.objects if o.type == "ARMATURE" and o.pose for pb in o.pose.bones if pb.custom_shape}
+    coords, comp_of, tris = [], [], []
+    stats = {"edges": 0, "boundary_edges": 0, "holes": 0, "non_manifold_edges": 0, "faces": 0,
+             "self_intersecting_faces": 0, "interpenetrating_faces": 0, "degenerate_faces": 0}
+    n_comp = 0
+    for obj in meshes:
+        if obj in shapes:
+            continue
+        ev = obj.evaluated_get(dg)
+        me = ev.to_mesh()
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        ev.to_mesh_clear()
+        bm.transform(obj.matrix_world)
+        bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=1e-6)
+        bmesh.ops.triangulate(bm, faces=list(bm.faces))
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        if not bm.verts:
+            bm.free()
+            continue
+        stats["edges"] += len(bm.edges)
+        stats["faces"] += len(bm.faces)
+        boundary = [e for e in bm.edges if e.is_boundary]
+        stats["boundary_edges"] += len(boundary)
+        stats["non_manifold_edges"] += sum(1 for e in bm.edges if e.is_wire or len(e.link_faces) > 2)
+        stats["degenerate_faces"] += sum(1 for f in bm.faces if f.calc_area() < 1e-12)
+        seen = set()  # holes = connected chains of boundary edges
+        for e in boundary:
+            if e.index in seen:
+                continue
+            stats["holes"] += 1
+            stack = [e]
+            seen.add(e.index)
+            while stack:
+                cur = stack.pop()
+                for v in cur.verts:
+                    for e2 in v.link_edges:
+                        if e2.is_boundary and e2.index not in seen:
+                            seen.add(e2.index)
+                            stack.append(e2)
+        label = [-1] * len(bm.verts)  # connected pieces
+        for v in bm.verts:
+            if label[v.index] >= 0:
+                continue
+            label[v.index] = n_comp
+            stack = [v]
+            while stack:
+                cur = stack.pop()
+                for e in cur.link_edges:
+                    o = e.other_vert(cur)
+                    if label[o.index] < 0:
+                        label[o.index] = n_comp
+                        stack.append(o)
+            n_comp += 1
+        tree = BVHTree.FromBMesh(bm)  # crossing triangle pairs that share no vertex
+        tri_verts = [{v.index for v in f.verts} for f in bm.faces]
+        same, other = set(), set()
+        for i, j in tree.overlap(tree):
+            if i != j and not (tri_verts[i] & tri_verts[j]):
+                same_piece = label[next(iter(tri_verts[i]))] == label[next(iter(tri_verts[j]))]
+                (same if same_piece else other).update((i, j))
+        stats["self_intersecting_faces"] += len(same)
+        stats["interpenetrating_faces"] += len(other)
+        offset = len(coords)
+        coords += [v.co.copy() for v in bm.verts]
+        comp_of += label
+        tris += [tuple(offset + v.index for v in f.verts) for f in bm.faces]
+        bm.free()
+    total = len(coords)
+    if not total:
+        return {"ok": False, "issues": ["no geometry"], **stats}
+    zs = [c.z for c in coords]
+    height = max(1e-6, max(zs) - min(zs))
+    gap = gap_frac * height
+    members, faces_of = {}, {}
+    for i, c in enumerate(comp_of):
+        members.setdefault(c, []).append(i)
+    for t in tris:
+        faces_of.setdefault(comp_of[t[0]], []).append(t)
+    main = max(members, key=lambda c: len(members[c]))
+    anchored, pending = {main}, set(members) - {main}
+
+    def touches(tree, c):
+        if any(tree.find_nearest(coords[i], gap)[0] is not None for i in members[c]):
+            return True
+        return bool(faces_of.get(c)) and bool(tree.overlap(BVHTree.FromPolygons(coords, faces_of[c], all_triangles=True)))
+
+    while pending:
+        tree = BVHTree.FromPolygons(coords, [t for c in anchored for t in faces_of.get(c, [])], all_triangles=True)
+        newly = {c for c in pending if touches(tree, c)}
+        if not newly:
+            break
+        anchored |= newly
+        pending -= newly
+    debris = [c for c in pending if len(members[c]) < debris_share * total]
+    detached = [c for c in pending if c not in debris]
+    share = lambda cs: round(100.0 * sum(len(members[c]) for c in cs) / total, 2)  # noqa: E731
+    return {
+        "components": len(members),
+        "debris_parts": len(debris),
+        "debris_pct": share(debris),
+        "detached_parts": len(detached),
+        "detached_pct": share(detached),
+        "vertices": total,
+        **stats,
+    }
 
 
 def load_mesh(path, rotate_z):
@@ -138,6 +266,8 @@ def main():
         setup(args.mode, args.res, meshes)
         files = {v: render(v, lo, hi, args.out, args.mode) for v in args.views.split(",")}
         res = {"ok": True, "files": files, "dims_m": [round(x, 4) for x in hi - lo], "tris": tris, "engine": bpy.context.scene.render.engine}
+        if args.integrity:
+            res["integrity"] = integrity(meshes, args.gap_frac, args.debris_share)
     except Exception as e:
         res = {"ok": False, "code": "RENDER_FAILED", "message": f"{type(e).__name__}: {e}", "fix": "The mesh failed to import or render; use another candidate."}
     with open(args.result, "w") as f:

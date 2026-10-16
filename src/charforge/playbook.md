@@ -11,8 +11,9 @@ You orchestrate tools. You never write Blender code, never write animation keyfr
 3. Get a candidate mesh:
    - Level >= 2: `generate_mesh(project_id, provider="auto")`. While `data.status == "running"`, call it again with the returned `job_id`.
    - Level 1: use the mesh file you were given.
-4. `score_mesh(project_id, mesh_path)`. Read `data.passed`, `data.iou`, `data.hints`, `data.pose_mismatch`.
+4. `score_mesh(project_id, mesh_path)`. Read `data.passed`, `data.iou`, `data.hints`, `data.pose_mismatch`, `data.integrity`.
    If a warning says the mesh is turned 90 degrees, re-score with `rotate_z=90`.
+   `data.critic` is an independent visual review (advisory). Report its issues; never re-grade renders yourself.
 5. Not passed (or a passed mesh fuses arms/legs the sheet keeps apart): follow `next_action` (`generate_mesh` for provider meshes or `mesh_fit` / `generate_mesh` for blockout meshes). Score again after every change.
 6. `stage` is `passed` or `stopped`: follow `next_action`. Provider meshes skip `mesh_fit` and `mesh_optimize` to preserve UVs/PBR textures and go directly to `mesh_export` -> `auto_rig` -> `animate`. Blockout meshes run `mesh_optimize` -> `mesh_export` -> `auto_rig` -> `animate`.
    While `auto_rig` or `animate` returns `data.status == "running"`, call the same tool again with the returned `job_id`.
