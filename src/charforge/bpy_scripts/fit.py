@@ -32,9 +32,10 @@ def parse():
     ap.add_argument("--out", required=True)
     ap.add_argument("--height-m", type=float, required=True)
     ap.add_argument("--rotate-z", type=float, default=0.0)
-    ap.add_argument("--scale-x", required=True)
-    ap.add_argument("--scale-y", required=True)
+    ap.add_argument("--scale-x", default="")
+    ap.add_argument("--scale-y", default="")
     ap.add_argument("--damp-arms", action="store_true", default=False)
+    ap.add_argument("--rigid-only", action="store_true", default=False)
     return ap.parse_args(sys.argv[sys.argv.index("--") + 1:])
 
 
@@ -74,80 +75,112 @@ def main():
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
         meshes = load_mesh(args.mesh, args.rotate_z)
 
-        # Join into single object if needed
-        bpy.ops.object.select_all(action='DESELECT')
-        for m in meshes:
-            m.select_set(True)
-        bpy.context.view_layer.objects.active = meshes[0]
-        if len(meshes) > 1:
-            bpy.ops.object.join()
-        mesh_obj = bpy.context.view_layer.objects.active
+        if getattr(args, "rigid_only", False):
+            # Rigid normalization only: rotate_z (already applied in load_mesh),
+            # ground feet at Z=0, center XY at (0, 0), and scale uniformly to height_m.
+            # Preserves multi-part hierarchies, UVs, textures, and PBR materials.
+            lo, hi, tris = bounds(meshes)
+            cur_h = hi.z - lo.z
+            if cur_h <= 0:
+                cur_h = 1.0
+            scale = args.height_m / cur_h
 
-        # Grounding, centering, and height scaling
-        lo, hi, _ = bounds([mesh_obj])
-        cur_h = hi.z - lo.z
-        if cur_h <= 0:
-            cur_h = 1.0
-        scale = args.height_m / cur_h
+            trans = Matrix.Translation(Vector((-(lo.x + hi.x) / 2.0, -(lo.y + hi.y) / 2.0, -lo.z)))
+            scl = Matrix.Scale(scale, 4)
+            xform = scl @ trans
 
-        # Center XY and ground feet at Z=0
-        mesh_obj.location.x -= (lo.x + hi.x) / 2.0
-        mesh_obj.location.y -= (lo.y + hi.y) / 2.0
-        mesh_obj.location.z -= lo.z
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
+            for obj in bpy.context.scene.objects:
+                if obj.parent is None:
+                    obj.matrix_world = xform @ obj.matrix_world
+            bpy.context.view_layer.update()
 
-        mesh_obj.scale = (scale, scale, scale)
-        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            bpy.ops.object.select_all(action='SELECT')
+            bpy.context.view_layer.objects.active = meshes[0]
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-        # Create 2x2x16 Lattice
-        lo, hi, _ = bounds([mesh_obj])
-        wx = max(hi.x - lo.x, 0.05)
-        wy = max(hi.y - lo.y, 0.05)
+            sc = bpy.context.scene
+            sc.unit_settings.system = 'METRIC'
+            sc.unit_settings.scale_length = 1.0
 
-        lat_data = bpy.data.lattices.new("FitLattice")
-        lat_data.points_u = 2
-        lat_data.points_v = 2
-        lat_data.points_w = 16
-        lat_data.interpolation_type_u = 'KEY_LINEAR'
-        lat_data.interpolation_type_v = 'KEY_LINEAR'
-        lat_data.interpolation_type_w = 'KEY_LINEAR'
+            lo2, hi2, tris = bounds(meshes)
+            dims_m = [round(hi2[i] - lo2[i], 4) for i in range(3)]
+            bpy.ops.export_scene.gltf(filepath=args.out, export_format='GLB')
+            res = {"ok": True, "mesh": args.out, "rigid_only": True, "dims_m": dims_m, "tris": tris}
+        else:
+            # Join into single object if needed
+            bpy.ops.object.select_all(action='DESELECT')
+            for m in meshes:
+                m.select_set(True)
+            bpy.context.view_layer.objects.active = meshes[0]
+            if len(meshes) > 1:
+                bpy.ops.object.join()
+            mesh_obj = bpy.context.view_layer.objects.active
 
-        lat_obj = bpy.data.objects.new("FitLattice", lat_data)
-        bpy.context.scene.collection.objects.link(lat_obj)
+            # Grounding, centering, and height scaling
+            lo, hi, _ = bounds([mesh_obj])
+            cur_h = hi.z - lo.z
+            if cur_h <= 0:
+                cur_h = 1.0
+            scale = args.height_m / cur_h
 
-        lat_obj.location = (0, 0, args.height_m / 2.0)
-        lat_obj.scale = (wx * 1.08, wy * 1.08, args.height_m / (lat_data.points_w - 1))
-        bpy.context.view_layer.update()
+            # Center XY and ground feet at Z=0
+            mesh_obj.location.x -= (lo.x + hi.x) / 2.0
+            mesh_obj.location.y -= (lo.y + hi.y) / 2.0
+            mesh_obj.location.z -= lo.z
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=False)
 
-        # Add lattice modifier to mesh
-        mod = mesh_obj.modifiers.new(name="Lattice", type='LATTICE')
-        mod.object = lat_obj
+            mesh_obj.scale = (scale, scale, scale)
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
 
-        # Deform control points
-        sx = [float(x) for x in args.scale_x.split(",")]
-        sy = [float(y) for y in args.scale_y.split(",")]
+            # Create 2x2x16 Lattice
+            lo, hi, _ = bounds([mesh_obj])
+            wx = max(hi.x - lo.x, 0.05)
+            wy = max(hi.y - lo.y, 0.05)
 
-        if getattr(args, "damp_arms", False):
-            # Arm height bands: w in [7, 13]
-            for w in range(7, 14):
-                if w < len(sx):
-                    sx[w] = 1.0 + (sx[w] - 1.0) * 0.20
+            lat_data = bpy.data.lattices.new("FitLattice")
+            lat_data.points_u = 2
+            lat_data.points_v = 2
+            lat_data.points_w = 16
+            lat_data.interpolation_type_u = 'KEY_LINEAR'
+            lat_data.interpolation_type_v = 'KEY_LINEAR'
+            lat_data.interpolation_type_w = 'KEY_LINEAR'
 
-        # In Blender lattice: w=0 is Z bottom (-0.5), w=15 is Z top (+0.5)
-        for i, pt in enumerate(lat_data.points):
-            w = i // 4
-            if w < len(sx) and w < len(sy):
-                pt.co_deform.x *= sx[w]
-                pt.co_deform.y *= sy[w]
+            lat_obj = bpy.data.objects.new("FitLattice", lat_data)
+            bpy.context.scene.collection.objects.link(lat_obj)
 
-        # Apply modifier
-        bpy.context.view_layer.objects.active = mesh_obj
-        bpy.ops.object.modifier_apply(modifier="Lattice")
-        bpy.data.objects.remove(lat_obj, do_unlink=True)
+            lat_obj.location = (0, 0, args.height_m / 2.0)
+            lat_obj.scale = (wx * 1.08, wy * 1.08, args.height_m / (lat_data.points_w - 1))
+            bpy.context.view_layer.update()
 
-        # Export result
-        bpy.ops.export_scene.gltf(filepath=args.out, export_format='GLB')
-        res = {"ok": True, "mesh": args.out}
+            # Add lattice modifier to mesh
+            mod = mesh_obj.modifiers.new(name="Lattice", type='LATTICE')
+            mod.object = lat_obj
+
+            # Deform control points
+            sx = [float(x) for x in args.scale_x.split(",") if x] if args.scale_x else [1.0] * 16
+            sy = [float(y) for y in args.scale_y.split(",") if y] if args.scale_y else [1.0] * 16
+
+            if getattr(args, "damp_arms", False):
+                # Arm height bands: w in [7, 13]
+                for w in range(7, 14):
+                    if w < len(sx):
+                        sx[w] = 1.0 + (sx[w] - 1.0) * 0.20
+
+            # In Blender lattice: w=0 is Z bottom (-0.5), w=15 is Z top (+0.5)
+            for i, pt in enumerate(lat_data.points):
+                w = i // 4
+                if w < len(sx) and w < len(sy):
+                    pt.co_deform.x *= sx[w]
+                    pt.co_deform.y *= sy[w]
+
+            # Apply modifier
+            bpy.context.view_layer.objects.active = mesh_obj
+            bpy.ops.object.modifier_apply(modifier="Lattice")
+            bpy.data.objects.remove(lat_obj, do_unlink=True)
+
+            # Export result
+            bpy.ops.export_scene.gltf(filepath=args.out, export_format='GLB')
+            res = {"ok": True, "mesh": args.out}
     except Exception as e:
         res = {"ok": False, "code": "FIT_FAILED", "message": f"{type(e).__name__}: {e}", "fix": "Check mesh geometry or retry with different candidate."}
 

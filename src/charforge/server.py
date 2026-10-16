@@ -16,7 +16,7 @@ except (ImportError, ModuleNotFoundError):
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import blender, config, score, sheet, state
+from . import blender, config, critic, score, sheet, state
 from .envelope import CFError, action, ok, tool_entry
 
 PLAYBOOK = Path(__file__).with_name("playbook.md").read_text()
@@ -25,7 +25,8 @@ INSTRUCTIONS = """CharForge turns a character turnaround sheet into a 3D model, 
 2. Every tool takes project_id. Lost track? Call project_status.
 3. Trust scores, not your eyes: a mesh is good only when score_mesh returns passed=true.
 4. ok=false: do exactly error.fix. The same error twice: stop and report it.
-5. Finished when next_action is null. Full procedure: prompt `charforge_playbook`."""
+5. Never write Blender code or keyframes; for a custom move use animate(motions=[...]).
+6. Finished when next_action is null; report rig_check, motion_check and the preview images. Full procedure: prompt `charforge_playbook`."""
 
 mcp = FastMCP("charforge", instructions=INSTRUCTIONS)
 
@@ -53,10 +54,12 @@ def project_create(
 @mcp.tool(annotations=READ_ONLY)
 @tool_entry
 def project_status(project_id: ProjectId) -> dict:
-    """Project state: stage, views, meshes, last scores, best mesh, outputs, call stats. Use it to resume."""
+    """Project state: stage, views, meshes, last scores, best mesh, outputs, rig/motion QA, call stats. Use it to resume."""
     p = state.load(project_id)
     data = {k: p[k] for k in ("stage", "name", "height_cm", "views", "meshes", "best", "outputs", "stop_reason")}
     data["scores"] = [{k: s.get(k) for k in ("mesh", "total", "passed", "iou")} for s in p["scores"][-5:]]
+    data["qa"] = {**(p.get("qa") or {}), "critic_calls": p.get("critic_calls", 0)}
+    data["animations"] = p.get("animations") or []
     data["stats"] = state.stats(project_id)
     return ok(data, project_id, state.suggest_next(p))
 
@@ -78,7 +81,10 @@ def sheet_split(
     if res["confidence"] < 0.8:
         warnings.append("Low split confidence: open data.preview and check the numbered candidates.")
         nxt = action("sheet_split", "Confirm views from the preview.", project_id=project_id, assign=["<front>", "<side>", "<back>"])
+    pose = (res["reference"] or {}).get("pose")
+    warnings += score.pose_warnings(pose, "sheet")
     data = {k: res[k] for k in ("candidates", "boxes", "confidence", "files", "preview")}
+    data["pose"] = pose
     return ok(data, project_id, nxt, warnings)
 
 
@@ -104,25 +110,76 @@ def render_views(
     return ok(data, project_id, state.suggest_next(p))
 
 
+def _mesh_critic(p: dict, pdir: Path, mesh: Path, rotate_z: int, out: Path) -> tuple[dict, list[str]]:
+    """Independent visual critic on a passed provider mesh: reference | color render per view, fixed rubric.
+    Advisory only; skipped silently in auto mode when no SDK/credentials, reported when it fails."""
+    try:
+        critic.check(p)
+    except critic.CriticUnavailable as e:
+        return {"skipped": str(e)}, ([f"Visual critic skipped: {e}"] if critic.settings(p)["mode"] == "on" else [])
+    try:
+        r = blender.run("render_views.py", {"mesh": mesh, "out": out, "mode": "color", "rotate_z": rotate_z})
+        rows = [[pdir / p["views"][v]["image"], r["files"][v]] for v in state.VIEWS]
+        sheet = score.contact_sheet(rows, out / "compare_color.png")
+        res = critic.critique_mesh(p, sheet)
+    except (critic.CriticFailed, critic.CriticUnavailable, CFError) as e:
+        return {"error": str(getattr(e, "message", e))}, [f"Visual critic failed: {getattr(e, 'message', e)}"]
+    res["compare"] = state.rel(p, sheet)
+    warnings = []
+    if res["overall"] < critic.settings(p)["warn_below"]:
+        warnings.append(f"Visual critic: {res['overall']}/10 against the sheet; " + "; ".join(res["issues"][:3]))
+    return res, warnings
+
+
 @mcp.tool(annotations=LOCAL_WRITE)
 @tool_entry
 def score_mesh(project_id: ProjectId, mesh_path: MeshPath, rotate_z: RotateZ = 0) -> dict:
-    """Score a mesh against the reference: silhouette IoU per view, total, passed, proportion hints, diff images."""
+    """Score a mesh against the reference: silhouette IoU per view, total, passed, proportion hints, diff images,
+    geometry integrity (floating parts, holes, self-intersections) and, for passed provider meshes, an
+    independent visual critic (advisory)."""
     p = state.load(project_id)
     if not p["views"]:
         raise CFError("VIEWS_MISSING", "Reference views are not extracted yet.", "Call sheet_split first.", action("sheet_split", "Needed before scoring.", project_id=project_id))
     mesh, rpath = state.mesh_path(p, mesh_path)
+    is_prov = state.is_provider_mesh(p, rpath)
     out = state.render_dir(p, rpath)
-    r = blender.run("render_views.py", {"mesh": mesh, "out": out, "mode": "mask", "rotate_z": rotate_z})
+    icfg = state.tunables(p, "integrity_thresholds", config.INTEGRITY)
+    r = blender.run(
+        "render_views.py",
+        {"mesh": mesh, "out": out, "mode": "mask", "rotate_z": rotate_z, "integrity": True,
+         "gap_frac": icfg["gap_frac"], "debris_share": icfg["debris_share"]},
+    )
     pdir = state.project_dir(project_id)
     ref = {v: score.load_mask(pdir / p["views"][v]["mask"]) for v in state.VIEWS}
     ren = {v: score.load_mask(r["files"][v]) for v in state.VIEWS}
-    res = score.compare(ref, ren, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15))
+    res = score.compare(ref, ren, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15), provider_mesh=is_prov)
+    warnings: list[str] = []
+    max_tris = p.get("max_provider_tris", config.MAX_PROVIDER_TRIS)
+    if is_prov and r["tris"] > max_tris:
+        res["passed"] = False
+        res["over_poly_budget"] = True
+        warnings.append(f"Provider mesh has {r['tris']} triangles (exceeds max {max_tris}); regenerate with smaller target_polycount.")
+    if res.get("rotated_90") and rotate_z == 0:
+        res["passed"] = False
+    else:
+        res["pose"] = score.pose_gaps(ren["front"])
+        res["pose_mismatch"] = score.pose_mismatch(p["reference"].get("pose"), res["pose"])
+        if res["pose_mismatch"]:
+            warnings.append(
+                f"Mesh fuses the {' and '.join(res['pose_mismatch'])} that the sheet keeps apart: rig weights will bleed there."
+            )
+    integ = score.integrity_report(r.get("integrity"), icfg)
+    if integ is not None:
+        res["integrity"] = integ
+        warnings += [f"Mesh integrity: {i}" for i in integ["issues"]]
+    if is_prov and res["passed"]:
+        res["critic"], w = _mesh_critic(p, pdir, mesh, rotate_z, out)
+        warnings += w
     diffs = {v: state.rel(p, f) for v, f in score.write_diffs(ref, ren, out).items()}
     next(m for m in p["meshes"] if m["path"] == rpath)["rotate_z"] = rotate_z
     state.record_score(p, {"mesh": rpath, "rotate_z": rotate_z, "tris": r["tris"], **res})
     state.save(p)
-    warnings, nxt = [], state.suggest_next(p)
+    nxt = state.suggest_next(p)
     if res.get("rotated_90") and rotate_z == 0:
         warnings.append("Mesh seems turned 90 degrees.")
         nxt = action("score_mesh", "Re-score with the mesh turned 90 degrees.", project_id=project_id, mesh_path=rpath, rotate_z=90)

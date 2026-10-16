@@ -4,6 +4,7 @@ Registered into FastMCP server when CHARFORGE_LEVEL >= 2.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -30,12 +31,34 @@ ProviderChoice = Literal["auto", "tripo", "meshy", "rodin", "hunyuan", "blockout
 ExportFormat = Literal["glb", "fbx", "both"]
 
 
+def _poll_provider(prov: providers.Provider, job_id: str, kind: str | None = None) -> dict:
+    """Call prov.poll(job_id, kind=kind) if supported by the provider, else prov.poll(job_id)."""
+    sig = inspect.signature(prov.poll)
+    if "kind" in sig.parameters:
+        return prov.poll(job_id, kind=kind)
+    return prov.poll(job_id)
+
+
+def _submit_provider(
+    prov: providers.Provider,
+    view_paths: dict[str, Path],
+    seed: int | None = None,
+    target_polycount: int | None = None,
+) -> str:
+    """Call prov.submit with target_polycount if supported by the provider."""
+    sig = inspect.signature(prov.submit)
+    if "target_polycount" in sig.parameters and target_polycount is not None:
+        return prov.submit(view_paths, seed=seed, target_polycount=target_polycount)
+    return prov.submit(view_paths, seed=seed)
+
+
 @tool_entry
 def generate_mesh(
     project_id: ProjectId,
     provider: ProviderChoice = "auto",
     job_id: Annotated[str | None, Field(description="Previous job_id if status was running")] = None,
     seed: Annotated[int | None, Field(description="Optional random seed for generation")] = None,
+    target_polycount: Annotated[int | None, Field(description="Optional target polycount for cloud generation", ge=100, le=300000)] = None,
 ) -> dict:
     """Generate a 3D candidate mesh via cloud provider (Tripo, Meshy, Rodin, Hunyuan) or local blockout."""
     p = state.load(project_id)
@@ -55,12 +78,13 @@ def generate_mesh(
             raise CFError("PROVIDER_FAILED", f"Job {job_id!r} not found in project jobs.", "Call generate_mesh without job_id to start a new job.")
 
         prov_name = job_info.get("provider", provider)
+        kind = job_info.get("kind")
         submitted_at = job_info.get("submitted_at", time.time())
         if time.time() - submitted_at > 1200:  # 20 minutes timeout
             raise CFError("PROVIDER_TIMEOUT", f"Job {job_id} exceeded 20 minutes.", "Retry with another provider or use provider='blockout'")
 
         prov = providers.get_provider(prov_name)
-        res = prov.poll(job_id)
+        res = _poll_provider(prov, job_id, kind=kind)
         status = res.get("status")
 
         if status == "running":
@@ -74,16 +98,27 @@ def generate_mesh(
             rpath = f"meshes/cand-{n_cands}-{prov_name}.glb"
             dst = pdir / rpath
             prov.download(res["url"], dst)
-            state.register_mesh(p, rpath, source=prov_name, seed=job_info.get("seed", seed), task_id=job_id)
+            state.register_mesh(p, rpath, source=prov_name, seed=job_info.get("seed", seed), task_id=job_id, provider=prov_name)
             job_info["status"] = "done"
             job_info["mesh_path"] = rpath
+            if res.get("consumed_credits") is not None:
+                job_info["consumed_credits"] = res["consumed_credits"]
             state.save(p)
             return ok(
-                {"status": "done", "job_id": job_id, "provider": prov_name, "mesh_path": rpath, "seconds": round(time.time() - t0, 2)},
+                {
+                    "status": "done",
+                    "job_id": job_id,
+                    "provider": prov_name,
+                    "mesh_path": rpath,
+                    "seconds": round(time.time() - t0, 2),
+                    **({"consumed_credits": res["consumed_credits"]} if res.get("consumed_credits") is not None else {}),
+                },
                 project_id,
                 action("score_mesh", "Score the generated candidate mesh.", project_id=project_id, mesh_path=rpath),
             )
         else:
+            job_info["status"] = "failed"
+            state.save(p)
             raise CFError("PROVIDER_FAILED", f"Provider {prov_name} job failed: {res.get('error')}", "Call generate_mesh with provider='blockout'")
 
     # 2. Starting new generation task
@@ -116,26 +151,49 @@ def generate_mesh(
     # Cloud provider submission
     prov = providers.get_provider(chosen)
     view_paths = {v: pdir / p["views"][v]["image"] for v in ("front", "side", "back") if v in p["views"]}
-    new_job_id = prov.submit(view_paths, seed=seed)
-    p["jobs"][new_job_id] = {"provider": chosen, "submitted_at": time.time(), "seed": seed, "status": "running"}
+    new_job_id = _submit_provider(prov, view_paths, seed=seed, target_polycount=target_polycount)
+    kind = getattr(prov, "last_submitted_kind", None) or (
+        ("multi-image-to-3d" if len(view_paths) > 1 else "image-to-3d") if chosen == "meshy" else "generation"
+    )
+    job_rec: dict = {
+        "provider": chosen,
+        "kind": kind,
+        "submitted_at": time.time(),
+        "seed": seed,
+        "status": "running",
+    }
+    if target_polycount is not None:
+        job_rec["target_polycount"] = target_polycount
+    p["jobs"][new_job_id] = job_rec
     state.save(p)
 
-    poll_res = prov.poll(new_job_id)
+    poll_res = _poll_provider(prov, new_job_id, kind=kind)
     if poll_res.get("status") == "done":
         n_cands = sum(1 for m in p["meshes"] if m.get("source") in ("blockout", "tripo", "meshy", "rodin", "hunyuan")) + 1
         rpath = f"meshes/cand-{n_cands}-{chosen}.glb"
         dst = pdir / rpath
         prov.download(poll_res["url"], dst)
-        state.register_mesh(p, rpath, source=chosen, seed=seed, task_id=new_job_id)
+        state.register_mesh(p, rpath, source=chosen, seed=seed, task_id=new_job_id, provider=chosen)
         p["jobs"][new_job_id]["status"] = "done"
         p["jobs"][new_job_id]["mesh_path"] = rpath
+        if poll_res.get("consumed_credits") is not None:
+            p["jobs"][new_job_id]["consumed_credits"] = poll_res["consumed_credits"]
         state.save(p)
         return ok(
-            {"status": "done", "job_id": new_job_id, "provider": chosen, "mesh_path": rpath, "seconds": round(time.time() - t0, 2)},
+            {
+                "status": "done",
+                "job_id": new_job_id,
+                "provider": chosen,
+                "mesh_path": rpath,
+                "seconds": round(time.time() - t0, 2),
+                **({"consumed_credits": poll_res["consumed_credits"]} if poll_res.get("consumed_credits") is not None else {}),
+            },
             project_id,
             action("score_mesh", "Score the generated candidate mesh.", project_id=project_id, mesh_path=rpath),
         )
     elif poll_res.get("status") == "failed":
+        p["jobs"][new_job_id]["status"] = "failed"
+        state.save(p)
         raise CFError("PROVIDER_FAILED", f"Provider {chosen} failed: {poll_res.get('error')}", "Call generate_mesh with provider='blockout'")
     else:
         return ok(
@@ -146,23 +204,58 @@ def generate_mesh(
 
 
 @tool_entry
-def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
-    """Fit mesh proportions to reference silhouettes using profile-guided 2x2x16 lattice deformation."""
+def mesh_fit(
+    project_id: ProjectId,
+    mesh_path: MeshPath,
+    rigid_only: Annotated[bool, Field(description="Apply rigid normalization only (rotate_z, ground feet, center XY, uniform height scale) without lattice deformation")] = False,
+) -> dict:
+    """Fit mesh proportions to reference silhouettes using profile-guided 2x2x16 lattice deformation (or rigid-only normalization for provider meshes)."""
     p = state.load(project_id)
     pdir = state.project_dir(project_id)
     mesh, rpath = state.mesh_path(p, mesh_path)
 
     # 1. Retrieve last score for this mesh
     last_score = next((s for s in reversed(p["scores"]) if s.get("mesh") == rpath), None)
-    if not last_score:
+    if not last_score and not rigid_only:
         raise CFError("FIT_FAILED", f"Mesh {rpath} has not been scored yet.", "Call score_mesh first before fitting.")
+
+    use_rigid = bool(rigid_only or state.is_provider_mesh(p, rpath))
+    rotate_z = last_score.get("rotate_z", 0) if last_score else (state.mesh_entry(p, rpath) or {}).get("rotate_z", 0)
+
+    if use_rigid:
+        stem = Path(rpath).stem
+        norm_count = sum(1 for m in p["meshes"] if f"{stem}-norm" in m["path"]) + 1
+        out_rpath = f"meshes/{stem}-norm{norm_count}.glb"
+        out_path = pdir / out_rpath
+        blender.run(
+            "fit.py",
+            {
+                "mesh": mesh,
+                "out": out_path,
+                "height_m": p["height_cm"] / 100.0,
+                "rotate_z": rotate_z,
+                "rigid_only": True,
+            },
+        )
+        state.register_mesh(p, out_rpath, source="normalized", derived_from=rpath, rotate_z=0)
+        state.save(p)
+        return ok(
+            {
+                "mesh_path": out_rpath,
+                "rigid_only": True,
+                "scale_x": [1.0] * 16,
+                "scale_y": [1.0] * 16,
+            },
+            project_id,
+            state.suggest_next(p),
+        )
 
     # 2. Render mask if not already on disk
     render_dir = state.render_dir(p, rpath)
     front_ren_mask = render_dir / "front_mask.png"
     side_ren_mask = render_dir / "side_mask.png"
     if not front_ren_mask.is_file() or not side_ren_mask.is_file():
-        blender.run("render_views.py", {"mesh": mesh, "out": render_dir, "mode": "mask", "rotate_z": last_score.get("rotate_z", 0)})
+        blender.run("render_views.py", {"mesh": mesh, "out": render_dir, "mode": "mask", "rotate_z": rotate_z})
 
     front_ref_mask = pdir / p["views"]["front"]["mask"]
     side_ref_mask = pdir / p["views"]["side"]["mask"]
@@ -193,8 +286,6 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
     prof_ren_s = score.width_profile(c_ren_s)
 
     # 3. Calculate 64-band ratios, then downsample to 16 lattice layers
-    # Note: width_profile has bin 0 at top (head) and bin 63 at bottom (feet).
-    # Blender lattice has layer w=0 at bottom (feet) and w=15 at top (head).
     ratio_x = [
         float(np.clip(prof_ref_f[i] / prof_ren_f[i], 0.8, 1.25))
         if prof_ren_f[i] > 0.01 and prof_ref_f[i] > 0.01 else 1.0
@@ -243,7 +334,7 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
         "mesh": mesh,
         "out": out_path,
         "height_m": p["height_cm"] / 100.0,
-        "rotate_z": last_score.get("rotate_z", 0),
+        "rotate_z": rotate_z,
         "scale_x": ",".join(f"{x:.4f}" for x in scale_x),
         "scale_y": ",".join(f"{y:.4f}" for y in scale_y),
         "damp_arms": arm_poses_differ,
@@ -252,7 +343,7 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
 
     # 6. Monotonicity guard: verify fit improved silhouette score
     out_render = state.render_dir(p, out_rpath)
-    r_ren = blender.run("render_views.py", {"mesh": out_path, "out": out_render, "mode": "mask", "rotate_z": last_score.get("rotate_z", 0)})
+    r_ren = blender.run("render_views.py", {"mesh": out_path, "out": out_render, "mode": "mask", "rotate_z": rotate_z})
     ref_masks = {v: score.load_mask(pdir / p["views"][v]["mask"]) for v in state.VIEWS}
     ren_masks = {v: score.load_mask(r_ren["files"][v]) for v in state.VIEWS}
     res_fit = score.compare(ref_masks, ren_masks, p["weights"], p["thresholds"], p["reference"].get("neck_ratio", 0.15))
@@ -271,8 +362,8 @@ def mesh_fit(project_id: ProjectId, mesh_path: MeshPath) -> dict:
         nxt = state.suggest_next(p)
     else:
         chosen_rpath = out_rpath
-        state.register_mesh(p, out_rpath, source="fit")
-        state.record_score(p, {"mesh": out_rpath, "rotate_z": last_score.get("rotate_z", 0), "tris": r_ren["tris"], **res_fit})
+        state.register_mesh(p, out_rpath, source="fit", derived_from=rpath)
+        state.record_score(p, {"mesh": out_rpath, "rotate_z": rotate_z, "tris": r_ren["tris"], **res_fit})
         state.save(p)
         nxt = action("score_mesh", "Score the fitted mesh.", project_id=project_id, mesh_path=out_rpath)
 
@@ -305,7 +396,7 @@ def mesh_optimize(
 
     # 1. First optimization pass
     r = blender.run("optimize.py", {"mesh": mesh, "out": out_path, "target_tris": target_tris})
-    state.register_mesh(p, out_rpath, source="optimized")
+    state.register_mesh(p, out_rpath, source="optimized", derived_from=rpath)
 
     # 2. Self-check re-scoring
     out_render = state.render_dir(p, out_rpath)
@@ -349,19 +440,52 @@ def mesh_export(
     mesh_path: MeshPath,
     format: Annotated[ExportFormat, Field(description="Export format: glb, fbx, or both")] = "glb",
 ) -> dict:
-    """Export final model with applied transforms and metric units to export/ directory."""
+    """Export final model with applied transforms and metric units to export/ directory.
+
+    For cloud provider meshes, applies rigid normalization (rotate_z, ground feet at Z=0,
+    center XY, uniform height_cm scale) preserving UVs, textures, and PBR materials.
+    """
     p = state.load(project_id)
     pdir = state.project_dir(project_id)
     mesh, rpath = state.mesh_path(p, mesh_path)
+
+    entry = state.mesh_entry(p, rpath) or {}
+    normalized_rpath: str | None = None
+
+    # Provider meshes bypass mesh_fit and mesh_optimize; apply rigid normalization before export
+    if state.is_provider_mesh(p, rpath) and entry.get("source") in config.PROVIDER_SOURCES:
+        last_score = next((s for s in reversed(p.get("scores", [])) if s.get("mesh") == rpath), None)
+        rotate_z = last_score.get("rotate_z", entry.get("rotate_z", 0)) if last_score else entry.get("rotate_z", 0)
+        stem = Path(rpath).stem
+        normalized_rpath = f"meshes/{stem}-norm.glb"
+        norm_path = pdir / normalized_rpath
+        blender.run(
+            "fit.py",
+            {
+                "mesh": mesh,
+                "out": norm_path,
+                "height_m": p["height_cm"] / 100.0,
+                "rotate_z": rotate_z,
+                "rigid_only": True,
+            },
+        )
+        state.register_mesh(p, normalized_rpath, source="normalized", derived_from=rpath, rotate_z=0)
+        mesh = norm_path
+        rpath = normalized_rpath
 
     out_dir = pdir / "export"
     r = blender.run("export.py", {"mesh": mesh, "out_dir": out_dir, "stem": project_id, "format": format})
 
     rel_files = {fmt: state.rel(p, path) for fmt, path in r["files"].items()}
+    for fmt, exp_rpath in rel_files.items():
+        state.register_mesh(p, exp_rpath, source="exported", derived_from=rpath)
+
     if "glb" in rel_files:
         p["outputs"]["glb"] = rel_files["glb"]
     if "fbx" in rel_files:
         p["outputs"]["fbx"] = rel_files["fbx"]
+    if normalized_rpath:
+        p["outputs"]["normalized"] = normalized_rpath
     p["stage"] = "exported"
     state.save(p)
 
@@ -370,6 +494,7 @@ def mesh_export(
             "files": rel_files,
             "size_mb": r["size_mb"],
             "tris": r["tris"],
+            **({"normalized_mesh": normalized_rpath} if normalized_rpath else {}),
         },
         project_id,
         state.suggest_next(p),

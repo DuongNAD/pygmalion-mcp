@@ -6,8 +6,10 @@ Operations:
 3. Bind mesh with ARMATURE_AUTO (bone heat capture via os.dup2), measure pre-fallback unweighted ratio.
 4. Two-tier fallback weighting: Tier 1 Geodesic BFS diffusion + Tier 2 Anatomical corridor IDW.
 5. Robust deformation & weight leakage self-check: swing LeftArm 40 deg around local Z.
-6. Export rigged model with armature to GLB.
-Result JSON: {ok: true, bones: int, unweighted_ratio: float, pre_fallback_ratio: float, mean_arm_disp: float, max_thigh_disp: float, mesh_path: str}
+6. Generic rig QA shared with provider rigs (cf_humanoid.run_qa, report only): all four limbs, contact gaps.
+7. Export rigged model with armature to GLB (+ humanoid map JSON when --humanoid is given).
+Result JSON: {ok: true, bones: int, unweighted_ratio: float, pre_fallback_ratio: float, mean_arm_disp: float, max_thigh_disp: float,
+              rig_check: {...}, humanoid: str|None, mesh_path: str}
 """
 import argparse
 import json
@@ -16,8 +18,12 @@ import os
 import sys
 import tempfile
 
-import bpy
-from mathutils import Vector
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import bpy  # noqa: E402
+from mathutils import Vector  # noqa: E402
+
+import cf_humanoid as hum  # noqa: E402
 
 IMPORTERS = {
     ".glb": lambda f: bpy.ops.import_scene.gltf(filepath=f),
@@ -87,6 +93,13 @@ def parse():
     ap.add_argument("--out", required=True)
     ap.add_argument("--neck-ratio", type=float, default=0.15)
     ap.add_argument("--ref-json", default=None)
+    ap.add_argument("--humanoid", default=None)
+    ap.add_argument("--angle", type=float, default=40.0)
+    ap.add_argument("--tol-m", type=float, default=0.005)
+    ap.add_argument("--max-ratio", type=float, default=0.01)
+    ap.add_argument("--hard-m", type=float, default=0.03)
+    ap.add_argument("--follow-min", type=float, default=0.6)
+    ap.add_argument("--gap-min-m", type=float, default=0.01)
     return ap.parse_args(raw_args)
 
 
@@ -740,6 +753,23 @@ def main():
         unweighted_ratio = bind_and_verify_weights(mesh_obj, arm_obj, neck_ratio)
         mean_arm_disp, max_thigh_disp = pose_deformation_check(mesh_obj, arm_obj)
 
+        # Generic QA (same check as provider rigs). Report only: this rig already enforces its own limb corridors
+        # above, and the generic repair would re-bind contact-zone vertices those corridors assign to the legs.
+        mapping = hum.map_roles(arm_obj)
+        qa = hum.run_qa(
+            arm_obj, [mesh_obj], mapping,
+            angle=getattr(args, "angle", 40.0), tol_m=getattr(args, "tol_m", 0.005),
+            max_ratio=getattr(args, "max_ratio", 0.01), hard_m=getattr(args, "hard_m", 0.03),
+            follow_min=getattr(args, "follow_min", 0.6), gap_min_m=getattr(args, "gap_min_m", 0.01),
+            repair=False,
+        )
+        qa["mapping"] = {k: mapping[k] for k in ("ok", "roles", "missing", "notes", "source")}
+        humanoid_path = getattr(args, "humanoid", None)
+        if humanoid_path:
+            os.makedirs(os.path.dirname(os.path.abspath(humanoid_path)), exist_ok=True)
+            with open(humanoid_path, "w", encoding="utf-8") as f:
+                json.dump(hum.humanoid_map(arm_obj, mapping), f, indent=2)
+
         # Export rigged model
         bpy.ops.object.select_all(action="DESELECT")
         mesh_obj.select_set(True)
@@ -765,6 +795,8 @@ def main():
             "mean_arm_disp": round(float(mean_arm_disp), 4),
             "max_thigh_disp": round(float(max_thigh_disp), 4),
             "max_disp": round(float(mean_arm_disp), 4),
+            "rig_check": qa,
+            "humanoid": humanoid_path,
             "mesh_path": args.out,
         }
     except Exception as e:

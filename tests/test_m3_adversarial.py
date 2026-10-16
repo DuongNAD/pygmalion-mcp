@@ -462,7 +462,10 @@ class TestAutoRigPermutationMatrix:
             if "/rigging" in url_str and request.method == "POST":
                 return httpx.Response(200, json={"result": "rig_task_999"})
             elif "/rigging/rig_task_999" in url_str:
-                return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/rig.glb"}})
+                return httpx.Response(
+                    200,
+                    json={"status": "SUCCEEDED", "result": {"rigged_character_glb_url": "https://meshy.mock/rig.glb"}},
+                )
             elif "meshy.mock/rig.glb" in url_str:
                 return httpx.Response(200, content=dummy_rig_glb)
             return httpx.Response(404)
@@ -520,7 +523,10 @@ class TestAutoRigPermutationMatrix:
                 submitted_heights.append(body["height_meters"])
                 return httpx.Response(200, json={"result": "rig_task_h"})
             elif request.method == "GET" and "/rigging/rig_task_h" in str(request.url):
-                return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": "https://meshy.mock/r.glb"}})
+                return httpx.Response(
+                    200,
+                    json={"status": "SUCCEEDED", "result": {"rigged_character_glb_url": "https://meshy.mock/r.glb"}},
+                )
             elif "meshy.mock/r.glb" in str(request.url):
                 return httpx.Response(200, content=b"glb")
             return httpx.Response(404)

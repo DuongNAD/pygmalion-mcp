@@ -22,6 +22,7 @@ VIEWS = ("front", "side", "back")
 MESH_EXTS = {".glb", ".fbx", ".obj", ".ply", ".stl"}
 SHEET_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 SEARCH_STAGES = {"views_ready", "scored", "passed", "stopped"}  # stages where score_mesh drives the policy
+DERIVED_SOURCES = {"external", "fit", "normalized", "optimized", "exported", "rigged", "animated"}
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,47}")
 
 
@@ -83,6 +84,81 @@ def rel(p: dict, path: Path | str) -> str:
     return Path(path).resolve().relative_to(project_dir(p["id"]).resolve()).as_posix()
 
 
+def mesh_entry(p: dict, rpath: str | None) -> dict | None:
+    """Return the mesh metadata entry in p['meshes'] matching rpath."""
+    if not rpath:
+        return None
+    return next((m for m in p.get("meshes", []) if isinstance(m, dict) and m.get("path") == rpath), None)
+
+
+def root_mesh_entry(p: dict, rpath: str | None) -> dict | None:
+    """Walk the derived_from chain in p['meshes'] to find the root ancestor entry."""
+    if not rpath:
+        return None
+    by_path = {m.get("path"): m for m in p.get("meshes", []) if isinstance(m, dict) and m.get("path")}
+    visited: set[str] = set()
+    curr: str | None = rpath
+    last_entry: dict | None = None
+    while curr and curr not in visited:
+        visited.add(curr)
+        entry = by_path.get(curr)
+        if not entry:
+            break
+        last_entry = entry
+        parent_path = entry.get("derived_from")
+        if not parent_path:
+            break
+        curr = parent_path
+    return last_entry
+
+
+def is_provider_mesh(p: dict, rpath: str | None) -> bool:
+    """Return True if rpath (or its root ancestor via derived_from) originated from a cloud provider."""
+    if not rpath:
+        return False
+    by_path = {m.get("path"): m for m in p.get("meshes", []) if isinstance(m, dict) and m.get("path")}
+    visited: set[str] = set()
+    curr: str | None = rpath
+    while curr and curr not in visited:
+        visited.add(curr)
+        entry = by_path.get(curr)
+        if not entry:
+            break
+        src = entry.get("source")
+        prov = entry.get("provider")
+        if src in config.PROVIDER_SOURCES or prov in config.PROVIDER_SOURCES:
+            return True
+        if src in ("blockout", "external") and not entry.get("derived_from"):
+            return False
+        curr = entry.get("derived_from")
+    return False
+
+
+def find_provider_task_id(p: dict, rpath: str | None, provider: str | None = None) -> str | None:
+    """Walk the derived_from chain in p['meshes'] to find the upstream cloud provider task_id."""
+    if not rpath:
+        return None
+    by_path = {m.get("path"): m for m in p.get("meshes", []) if isinstance(m, dict) and m.get("path")}
+    visited: set[str] = set()
+    curr: str | None = rpath
+    while curr and curr not in visited:
+        visited.add(curr)
+        entry = by_path.get(curr)
+        if not entry:
+            break
+        src = entry.get("source")
+        prov = entry.get("provider") or (src if src in config.PROVIDER_SOURCES else None)
+        if src in ("blockout", "external") and not entry.get("derived_from") and not prov:
+            return None
+        if prov in config.PROVIDER_SOURCES and (provider is None or prov == provider):
+            if entry.get("task_id"):
+                return str(entry["task_id"])
+            if entry.get("job_id"):
+                return str(entry["job_id"])
+        curr = entry.get("derived_from")
+    return None
+
+
 def mesh_path(p: dict, arg: str) -> tuple[Path, str]:
     """Resolve a mesh argument to (absolute path inside the project, project-relative path).
     External files are copied into meshes/ so a project is self-contained."""
@@ -105,19 +181,56 @@ def mesh_path(p: dict, arg: str) -> tuple[Path, str]:
     return src, rpath
 
 
-def register_mesh(p: dict, rpath: str, source: str = "blockout", seed: int | None = None, task_id: str | None = None, **meta) -> None:
-    existing = next((m for m in p["meshes"] if m["path"] == rpath), None)
+def register_mesh(
+    p: dict,
+    rpath: str,
+    source: str = "blockout",
+    seed: int | None = None,
+    task_id: str | None = None,
+    derived_from: str | None = None,
+    provider: str | None = None,
+    **meta,
+) -> None:
+    if derived_from:
+        parent = mesh_entry(p, derived_from)
+        if parent is not None:
+            if task_id is None and parent.get("task_id"):
+                task_id = str(parent["task_id"])
+            if provider is None:
+                p_prov = parent.get("provider") or (
+                    parent.get("source") if parent.get("source") in config.PROVIDER_SOURCES else None
+                )
+                if p_prov:
+                    provider = str(p_prov)
+
+    if source in config.PROVIDER_SOURCES and provider is None:
+        provider = source
+
+    existing = mesh_entry(p, rpath)
     if existing is not None:
+        if source != "external" and existing.get("source") == "external":
+            existing["source"] = source
         if task_id is not None and not existing.get("task_id"):
             existing["task_id"] = task_id
+        if derived_from is not None and not existing.get("derived_from"):
+            existing["derived_from"] = derived_from
+        if provider is not None and not existing.get("provider"):
+            existing["provider"] = provider
         if seed is not None and "seed" not in existing:
             existing["seed"] = seed
+        for k, v in meta.items():
+            existing[k] = v
         return
+
     entry = {"path": rpath, "source": source, "rotate_z": 0, "created_at": _now(), **meta}
     if seed is not None:
         entry["seed"] = seed
     if task_id is not None:
         entry["task_id"] = task_id
+    if derived_from is not None:
+        entry["derived_from"] = derived_from
+    if provider is not None:
+        entry["provider"] = provider
     p["meshes"].append(entry)
 
 
@@ -127,18 +240,81 @@ def render_dir(p: dict, rpath: str) -> Path:
     return out
 
 
+def tunables(p: dict, key: str, defaults: dict) -> dict:
+    """config defaults overridden per project by project.json[key]."""
+    return {**defaults, **(p.get(key) or {})}
+
+
+def _gate(rec: dict) -> tuple:
+    """Hard order between meshes: passed first; among passed ones a clean pose (no arms/legs fused that the
+    sheet keeps apart) and sound geometry (no detached parts) beat silhouette IoU, because both ruin the rig."""
+    if not rec.get("passed"):
+        return (False, True, True)
+    integ = rec.get("integrity") or {}
+    integrity_ok = rec.get("integrity_ok", integ.get("ok", True)) is not False
+    return (True, not rec.get("pose_mismatch"), integrity_ok)
+
+
+def _critic_overall(rec: dict) -> float | None:
+    c = rec.get("critic")
+    if isinstance(c, dict) and c.get("overall") is not None:
+        return float(c["overall"])
+    return rec.get("critic_overall")
+
+
+def _better(p: dict, rec: dict, best: dict) -> bool:
+    """rec beats best? Gate first; then, between passed meshes the visual critic decides when it differs by at
+    least CRITIC.min_delta points (both graded); otherwise the silhouette total."""
+    ga, gb = _gate(rec), _gate(best)
+    if ga != gb:
+        return ga > gb
+    if ga[0]:
+        ca, cb = _critic_overall(rec), _critic_overall(best)
+        if ca is not None and cb is not None and abs(ca - cb) >= tunables(p, "critic_params", config.CRITIC)["min_delta"]:
+            return ca > cb
+    return rec.get("total", 0.0) > best.get("total", 0.0)
+
+
 def record_score(p: dict, rec: dict) -> None:
     """Append a score ({mesh, total, passed, iou, ...}); in search stages update best/stage/stop_reason."""
     p["scores"].append({**rec, "at": _now()})
     if p["stage"] not in SEARCH_STAGES:
         return  # post-search check (e.g. after optimize): record only
-    if not p["best"] or rec["total"] > p["best"]["total"]:
+    if not p["best"] or _better(p, rec, p["best"]):
         p["best"] = {"mesh": rec["mesh"], "total": rec["total"], "passed": rec["passed"]}
+        if rec.get("pose_mismatch"):
+            p["best"]["pose_mismatch"] = rec["pose_mismatch"]
+        if (rec.get("integrity") or {}).get("ok") is not None:
+            p["best"]["integrity_ok"] = rec["integrity"]["ok"]
+        if _critic_overall(rec) is not None:
+            p["best"]["critic_overall"] = _critic_overall(rec)
+
+    # If mesh appears turned 90 degrees and hasn't been rotated yet, stay in 'scored' for re-scoring
+    if rec.get("rotated_90") and rec.get("rotate_z", 0) == 0:
+        p["stage"] = "scored"
+        return
+
     totals = [s["total"] for s in p["scores"]]
     k = config.PLATEAU_ROUNDS
     plateau = len(totals) > k and max(totals[-k:]) - max(totals[:-k]) < config.PLATEAU_EPS
+    n_cand = sum(1 for m in p.get("meshes", []) if m.get("source") not in DERIVED_SOURCES)
+    prov_mesh = is_provider_mesh(p, rec.get("mesh"))
+
     if p["best"]["passed"]:
-        p["stage"], p["stop_reason"] = "passed", None
+        retry = (
+            p["best"].get("pose_mismatch")
+            and is_provider_mesh(p, p["best"]["mesh"])
+            and p.get("pose_retries", 0) < config.POSE_RETRY
+            and n_cand < config.MAX_CANDIDATES
+            and len(totals) < config.MAX_ITERATIONS
+        )
+        if retry:  # the generator fused parts the sheet keeps apart: one more candidate for a clean rig
+            p["pose_retries"] = p.get("pose_retries", 0) + 1
+            p["stage"], p["stop_reason"] = "scored", None
+        else:
+            p["stage"], p["stop_reason"] = "passed", None
+    elif prov_mesh and n_cand >= config.MAX_CANDIDATES:
+        p["stage"], p["stop_reason"] = "stopped", "budget"
     elif len(totals) >= config.MAX_ITERATIONS:
         p["stage"], p["stop_reason"] = "stopped", "budget"
     elif plateau:
@@ -160,12 +336,36 @@ def suggest_next(p: dict) -> dict | None:
     if st == "scored":
         if lvl < 2:
             return action("score_mesh", "Fix the mesh using data.hints, then score the new file.", project_id=pid, mesh_path="<new mesh>")
-        n_cand = sum(m["source"] not in ("external", "fit") for m in p["meshes"])
+        n_cand = sum(1 for m in p["meshes"] if m.get("source") not in DERIVED_SOURCES)
+        if is_provider_mesh(p, best):
+            last_sc = p["scores"][-1] if p.get("scores") else {}
+            if p["best"].get("passed") and p["best"].get("pose_mismatch") and n_cand < config.MAX_CANDIDATES:
+                parts = " and ".join(p["best"]["pose_mismatch"])
+                return action(
+                    "generate_mesh",
+                    f"Best mesh fuses the {parts} that the sheet keeps apart; one more candidate for a clean rig.",
+                    project_id=pid,
+                    provider="auto",
+                )
+            if n_cand < config.MAX_CANDIDATES:
+                if last_sc.get("over_poly_budget"):
+                    smaller_poly = max(5000, config.MESHY_TARGET_POLYCOUNT // 2)
+                    return action(
+                        "generate_mesh",
+                        "Provider mesh exceeds triangle budget; regenerate with smaller target_polycount.",
+                        project_id=pid,
+                        provider="auto",
+                        target_polycount=smaller_poly,
+                    )
+                return action("generate_mesh", "Provider candidate below threshold; generate a new candidate.", project_id=pid, provider="auto")
+            return action("mesh_export", "Candidate budget reached; normalize and export best provider mesh.", project_id=pid, mesh_path=best, format="glb")
         if p["best"]["total"] < config.REGENERATE_BELOW and n_cand < config.MAX_CANDIDATES:
             return action("generate_mesh", "Best candidate is far off; try a new candidate.", project_id=pid, provider="auto")
         return action("mesh_fit", "Fit the best candidate's proportions to the reference, then re-score.", project_id=pid, mesh_path=best)
     if st in ("passed", "stopped"):
         if lvl >= 2:
+            if is_provider_mesh(p, best):
+                return action("mesh_export", "Search finished; normalize and export the best provider mesh.", project_id=pid, mesh_path=best, format="glb")
             return action("mesh_optimize", "Search finished; clean up the best mesh.", project_id=pid, mesh_path=best)
         return action("render_views", "Level 1 done: render color previews of the best mesh.", project_id=pid, mesh_path=best, mode="color") if best else None
     if st == "optimized":

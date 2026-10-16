@@ -250,7 +250,7 @@ def test_animate_provider_missing_rig_task_id(tmp_path, monkeypatch):
 # ==============================================================================
 
 def test_animate_method_provider_multi_clip_mock_transport(tmp_path, monkeypatch):
-    """Verify animate(method='provider') multi-clip orchestration with MockTransport."""
+    """Verify animate(method='provider') multi-clip orchestration with MockTransport using real Meshy API schema."""
     monkeypatch.setenv("CHARFORGE_LEVEL", "3")
     monkeypatch.setenv("MESHY_API_KEY", "test-meshy-key")
 
@@ -267,47 +267,45 @@ def test_animate_method_provider_multi_clip_mock_transport(tmp_path, monkeypatch
 
     p = state.load(pid)
     p["outputs"]["rigged"] = rig_rpath
-    p["rig_task_id"] = "rig_task_provider_123"
+    p["outputs"]["rig_task_id"] = "0193rig0-0123-4000-8000-000000000123"
     state.save(p)
 
-    # Setup mock transport for Meshy animations endpoint
-    action_clips = {
-        1: create_synthetic_glb(["idle"]),
-        2: create_synthetic_glb(["walk"]),
-        3: create_synthetic_glb(["wave"]),
-    }
-    submitted_tasks = []
+    # Setup mock transport for Meshy animations/library and /animations endpoints
+    mock_library = [
+        {"action_id": 17, "name": "Idle", "key": "Idle", "category": "DailyActions", "sub_category": "Idle"},
+        {"action_id": 42, "name": "Walking_Woman", "key": "Walking_Woman", "category": "WalkAndRun", "sub_category": "Walking"},
+        {"action_id": 108, "name": "Waving_Gesture", "key": "Waving_Gesture", "category": "BodyMovements", "sub_category": "Greeting"},
+    ]
+    provider_merged_glb = create_synthetic_glb(["Idle", "Walking_Woman", "Waving_Gesture"])
+    submitted_payloads = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
-        if request.method == "POST" and "/animations" in url_str:
+        if request.method == "GET" and url_str.endswith("/openapi/v1/animations/library"):
+            return httpx.Response(200, json=mock_library)
+        elif request.method == "POST" and url_str.endswith("/openapi/v1/animations"):
             body = json.loads(request.content.decode("utf-8"))
-            act_id = body.get("action_id", 1)
-            task_id = f"anim_task_{act_id}"
-            submitted_tasks.append((body.get("rig_task_id"), act_id))
-            return httpx.Response(200, json={"result": task_id})
-        elif request.method == "GET" and "/animations/anim_task_" in url_str:
-            act_id = int(url_str.split("_")[-1])
-            return httpx.Response(200, json={"status": "SUCCEEDED", "model_urls": {"glb": f"https://mock.cdn/anim_{act_id}.glb"}})
-        elif request.method == "GET" and "mock.cdn/anim_" in url_str:
-            act_id = int(url_str.split("/")[-1].replace(".glb", "").replace("anim_", ""))
-            return httpx.Response(200, content=action_clips[act_id])
+            submitted_payloads.append(body)
+            return httpx.Response(202, json={"result": "0193anim-0456-4000-8000-000000000456"})
+        elif request.method == "GET" and "/openapi/v1/animations/0193anim-0456-4000-8000-000000000456" in url_str:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "0193anim-0456-4000-8000-000000000456",
+                    "status": "SUCCEEDED",
+                    "result": {"animation_glb_url": "https://mock.cdn/anim_merged.glb"},
+                },
+            )
+        elif request.method == "GET" and "mock.cdn/anim_merged.glb" in url_str:
+            return httpx.Response(200, content=provider_merged_glb)
         return httpx.Response(404)
 
     mock_client = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr(providers, "get_provider", lambda name, client=None: providers.MeshyProvider(api_key="test-meshy-key", client=client or mock_client))
-
-    # Mock blender.run for merge_animations.py
-    blender_runs = []
-    def mock_blender_run(script_name, args):
-        blender_runs.append((script_name, args))
-        out_p = Path(args["out"])
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        requested_acts = args["actions"].split(",")
-        out_p.write_bytes(create_synthetic_glb(requested_acts))
-        return {"ok": True, "actions": requested_acts, "clip_count": len(requested_acts), "mesh_path": str(out_p)}
-
-    monkeypatch.setattr(blender, "run", mock_blender_run)
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda name, client=None: providers.MeshyProvider(api_key="test-meshy-key", client=client or mock_client),
+    )
 
     # Execute animate
     res = tools_full.animate(
@@ -317,12 +315,17 @@ def test_animate_method_provider_multi_clip_mock_transport(tmp_path, monkeypatch
     )
 
     assert res["ok"] is True
+    assert res["data"]["status"] == "done"
     assert res["data"]["method"] == "provider"
     assert res["data"]["actions"] == ["idle", "walk", "wave"]
     assert res["data"]["clip_count"] == 3
-    assert len(submitted_tasks) == 3
-    assert len(blender_runs) == 1
-    assert blender_runs[0][1]["mode"] == "merge"
+    assert len(submitted_payloads) == 1
+    assert submitted_payloads[0]["rig_task_id"] == "0193rig0-0123-4000-8000-000000000123"
+    assert submitted_payloads[0]["action_ids"] == [17, 42, 108]
+
+    # Verify exported GLB has renamed tracks matching requested actions
+    out_glb = pdir / res["data"]["mesh_path"]
+    assert inspect_glb_animations(out_glb) == ["idle", "walk", "wave"]
 
     # Verify state updated
     p_after = state.load(pid)
@@ -331,6 +334,61 @@ def test_animate_method_provider_multi_clip_mock_transport(tmp_path, monkeypatch
     assert len(p_after["animations"]) == 3
     assert [a["name"] for a in p_after["animations"]] == ["idle", "walk", "wave"]
     assert res["next_action"] is None
+
+
+def test_animate_provider_names_sharing_one_action_id(tmp_path, monkeypatch):
+    """['walk', 'walk', 'idle'] resolves to ids [W, W, I]; Meshy returns 2 clips (W, I): idle must get clip I."""
+    monkeypatch.setenv("CHARFORGE_LEVEL", "3")
+    monkeypatch.setenv("MESHY_API_KEY", "k")
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"dummy")
+    pid = server.project_create(sheet_path=str(sheet), name="SharedIds", height_cm=165.0)["project_id"]
+    pdir = state.project_dir(pid)
+    (pdir / "export").mkdir(exist_ok=True)
+    (pdir / f"export/{pid}-rigged.glb").write_bytes(create_synthetic_glb(["tpose"]))
+    p = state.load(pid)
+    p["outputs"]["rigged"] = f"export/{pid}-rigged.glb"
+    p["outputs"]["rig_task_id"] = "rig-1"
+    state.save(p)
+
+    gltf = {
+        "asset": {"version": "2.0"},
+        "nodes": [{"name": "Root"}],
+        "animations": [
+            {"name": "Walking", "channels": [], "samplers": [{"input": 0, "output": 1}]},
+            {"name": "Idle", "channels": [], "samplers": [{"input": 2, "output": 3}]},
+        ],
+    }
+    jb = json.dumps(gltf).encode()
+    jb += b" " * ((4 - len(jb) % 4) % 4)
+    two_clips = struct.pack("<4sII", b"glTF", 2, 20 + len(jb)) + struct.pack("<I4s", len(jb), b"JSON") + jb
+    posted = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        u = str(req.url)
+        if u.endswith("/animations/library"):
+            return httpx.Response(200, json=[{"action_id": 42, "name": "Walking", "key": "Walking"}, {"action_id": 17, "name": "Idle", "key": "Idle"}])
+        if req.method == "POST":
+            posted.append(json.loads(req.content))
+            return httpx.Response(202, json={"result": "anim-1"})
+        if u.endswith("/animations/anim-1"):
+            return httpx.Response(200, json={"status": "SUCCEEDED", "result": {"animation_glb_url": "https://cdn.mock/a.glb"}})
+        if u == "https://cdn.mock/a.glb":
+            return httpx.Response(200, content=two_clips)
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(providers, "get_provider", lambda name, client_=None, **kw: providers.MeshyProvider(api_key="k", client=client))
+    res = tools_full.animate(project_id=pid, actions=["walk", "walk", "idle"], method="provider", secondary="off")
+    assert res["ok"], res
+    assert posted[0]["action_ids"] == [42, 17]
+    out = pdir / res["data"]["mesh_path"]
+    data = out.read_bytes()
+    n = struct.unpack("<I", data[12:16])[0]
+    anims = json.loads(data[20:20 + n])["animations"]
+    assert [a["name"] for a in anims] == ["walk", "walk_01", "idle"]
+    assert [a["samplers"][0]["input"] for a in anims] == [0, 0, 2]  # idle is Meshy's Idle clip, not a second walk
+    assert [a["action_id"] for a in state.load(pid)["animations"]] == [42, 42, 17]
 
 
 # ==============================================================================
