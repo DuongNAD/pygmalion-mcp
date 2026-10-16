@@ -18,7 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-critic = ["anthropic>=1.15"]  # independent visual critic (score_mesh / animate); off without it
+critic = ["google-genai>=2.18"]  # independent visual critic, Gemini backend (score_mesh / animate); off without it
+critic-claude = ["anthropic>=1.15"]  # Claude backend for the same critic
 
 [project.scripts]
 charforge = "charforge.__main__:main"

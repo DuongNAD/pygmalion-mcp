@@ -58,10 +58,13 @@ Toàn bộ quy trình từ ảnh turnaround 2D phẳng đến model 3D rigged & 
 
 ### Kiểm toàn vẹn mesh và critic thị giác độc lập (`score_mesh`, `animate`)
 - **Toàn vẹn hình học** (luôn chạy, chỉ bằng số): đếm mảnh vụn, phần bị tách khỏi thân, lỗ hở, cạnh non-manifold và bề mặt tự cắt. Mesh có phần bị tách hoặc tự cắt nhiều sẽ xếp sau mesh lành trong số các mesh đã passed.
-- **Critic thị giác** (tùy chọn): Claude so ảnh sheet với ảnh render màu theo rubric cố định gồm mặt, texture, chi tiết, giải phẫu và lỗi hình học, rồi chấm điểm 0–10 kèm lỗi cụ thể. Với animation, critic soi contact sheet từng clip để tìm tư thế gượng, xuyên vật thể và biến dạng.
+- **Critic thị giác** (tùy chọn): một model thị giác (mặc định Gemini 4 Argon, hoặc Claude) so ảnh sheet với ảnh render màu theo rubric cố định gồm mặt, texture, chi tiết, giải phẫu và lỗi hình học, rồi chấm điểm 0–10 kèm lỗi cụ thể. Với animation, critic soi contact sheet từng clip để tìm tư thế gượng, xuyên vật thể và biến dạng.
   - Model điều phối không bao giờ tự chấm sản phẩm của mình.
   - Critic chỉ tư vấn: không đổi `passed`, chỉ chọn giữa hai mesh đã passed khi chênh từ 1 điểm trở lên, và đưa ra cảnh báo.
-  - Cài: `pip install -e ".[critic]"`, đặt `ANTHROPIC_API_KEY`, rồi tùy chọn đặt `CHARFORGE_CRITIC=auto|on|off`. Mặc định dùng `claude-opus-5-5` với fallback phía server `"default"`, tối đa 6 lượt gọi mỗi project. Khi bật, ảnh sheet và ảnh render được gửi tới Claude API.
+  - Dùng Gemini (mặc định): `pip install -e ".[critic]"` rồi đặt `GEMINI_API_KEY`. Dùng Claude: `pip install -e ".[critic-claude]"` rồi đặt `ANTHROPIC_API_KEY`.
+  - `CHARFORGE_CRITIC=auto|on|off` để bật/tắt, `CHARFORGE_CRITIC_BACKEND=auto|gemini|claude` để chọn model (auto ưu tiên Gemini khi có key). Model mặc định là `gemini-4-argon` và `claude-opus-5-5` (đổi trong `CRITIC.models` ở `config.py`). Tối đa 6 lượt gọi mỗi project. `python -m charforge --check` cho biết critic đang dùng model nào, hoặc còn thiếu gì.
+  - Nếu model điều phối cũng là Gemini (ví dụ Antigravity), có thể đặt `CHARFORGE_CRITIC_BACKEND=claude` để critic đến từ một họ model khác.
+  - Khi bật, ảnh sheet và ảnh render được gửi tới Gemini API hoặc Claude API. Gemini được gọi với `store=false`, nên interaction không được lưu lại để truy xuất sau.
 
 ### Khe hở tư thế (A-pose) quan trọng ngang code
 `sheet_split` và `score_mesh` đo khe hở giữa cẳng tay/bàn tay với thân và giữa hai ống chân trên silhouette front. Tay sát thân hoặc hai đùi dính nhau là nguyên nhân chính khiến trọng số rò ("dính" khi chạy animation). Sheet dính → cảnh báo sớm. Sheet tách rời mà mesh Meshy lại dính → pipeline sinh thêm một ứng viên và ưu tiên mesh không dính.

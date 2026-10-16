@@ -1,11 +1,13 @@
-"""Independent visual critic: request shape, scoring, budget, failure handling, and how it feeds the policy.
-No network and no SDK needed: a fake client stands in for anthropic.Anthropic()."""
+"""Independent visual critic: request shape, scoring, budget, failure handling, backend choice, and how it feeds
+the policy. No network: a fake client stands in for anthropic.Anthropic(), and the real google-genai SDK talks to an
+httpx mock transport (those tests skip when google-genai is not installed)."""
 import base64
 import json
 import types
 from pathlib import Path
 
 import cv2
+import httpx
 import numpy as np
 import pytest
 
@@ -52,9 +54,10 @@ def img(tmp_path):
 def fake(monkeypatch):
     def install(*responses, raises=None):
         client = FakeClient(*responses, raises=raises)
-        monkeypatch.setattr(critic, "_client_override", client)
+        monkeypatch.setattr(critic, "_client_override", {"claude": client})
         return client
     monkeypatch.delenv("CHARFORGE_CRITIC", raising=False)
+    monkeypatch.setenv("CHARFORGE_CRITIC_BACKEND", "claude")
     return install
 
 
@@ -77,7 +80,7 @@ def test_mesh_request_shape_and_scoring(fake, img):
     expected = (w["face"] * 8 + w["texture"] * 7 + w["details"] * 6 + w["anatomy"] * 10) / sum(w.values())
     assert res["overall"] == round(expected, 2)
     assert res["issues"] == ["front: left hand fused to the hip"]
-    assert res["usage"]["input_tokens"] == 1200
+    assert res["usage"]["input_tokens"] == 1200 and res["usage"]["backend"] == "claude"
     assert p["critic_calls"] == 1
 
 
@@ -99,12 +102,12 @@ def test_budget_and_modes(fake, img, monkeypatch):
     with pytest.raises(critic.CriticUnavailable, match="off"):
         critic.check({})
     monkeypatch.setenv("CHARFORGE_CRITIC", "auto")
-    monkeypatch.setattr(critic, "_client_override", None)
-    monkeypatch.setattr(critic, "_sdk", lambda: None)
-    with pytest.raises(critic.CriticUnavailable, match="charforge\\[critic\\]"):
+    monkeypatch.setattr(critic, "_client_override", {})
+    monkeypatch.setattr(critic, "_sdk", lambda b: None)
+    with pytest.raises(critic.CriticUnavailable, match="charforge\\[critic-claude\\]"):
         critic.check({})
-    monkeypatch.setattr(critic, "_sdk", lambda: types.SimpleNamespace())
-    monkeypatch.setattr(critic, "_has_credentials", lambda: False)
+    monkeypatch.setattr(critic, "_sdk", lambda b: types.SimpleNamespace())
+    monkeypatch.setattr(critic, "_has_credentials", lambda b: False)
     with pytest.raises(critic.CriticUnavailable, match="credentials"):
         critic.check({})
 
@@ -126,7 +129,7 @@ def test_api_errors_map_to_short_reasons(fake, img, monkeypatch):
 
     sdk = types.SimpleNamespace(APIConnectionError=APIConnectionError, APIStatusError=APIStatusError,
                                 AuthenticationError=AuthenticationError, RateLimitError=RateLimitError)
-    monkeypatch.setattr(critic, "_sdk", lambda: sdk)
+    monkeypatch.setattr(critic, "_sdk", lambda b: sdk)
     for exc, text in ((RateLimitError(429), "rate limit"), (AuthenticationError(401), "credentials"),
                       (APIStatusError(500), "error 500"), (APIConnectionError(), "network")):
         fake(raises=exc)
@@ -145,6 +148,147 @@ def test_motion_clips_mapped_by_name_then_position(fake, img):
     res = critic.critique_motion({}, {"walk": img, "wave": img})
     assert set(res["clips"]) == {"walk", "wave"}
     assert res["clips"]["walk"]["overall"] == 7.25 and res["clips"]["wave"]["overall"] == 8.0
+
+
+# ---------------------------------------------------------------- Gemini backend (real SDK, mock HTTP)
+
+def interaction(answer=None, status="completed", text=None, errors=None):
+    """An Interactions API reply as the Gemini API sends it."""
+    body = json.dumps(answer) if text is None else text
+    reply = {
+        "id": "int-1", "object": "interaction", "status": status, "model": "gemini-4-argon",
+        "steps": [{"type": "model_output", "content": [{"type": "text", "text": body}]}] if body else [],
+        "usage": {"total_input_tokens": 2100, "total_output_tokens": 180, "total_thought_tokens": 900, "total_tokens": 3180},
+    }
+    if errors:
+        reply["errors"] = errors
+    return reply
+
+
+def api_error(code, status, message):
+    return httpx.Response(code, json={"error": {"code": code, "message": message, "status": status}})
+
+
+@pytest.fixture
+def gemini(monkeypatch):
+    genai = pytest.importorskip("google.genai")
+    if not hasattr(genai.Client, "interactions"):
+        pytest.skip("google-genai without the Interactions API")
+    from google.genai import types as gtypes
+    monkeypatch.delenv("CHARFORGE_CRITIC", raising=False)
+    monkeypatch.setenv("CHARFORGE_CRITIC_BACKEND", "gemini")
+
+    def install(*replies):
+        seen, queue = [], list(replies)
+
+        def handler(request):
+            seen.append(request)
+            reply = queue.pop(0) if len(queue) > 1 else queue[0]  # SDK retries see the last reply again
+            if reply == "network":
+                raise httpx.ConnectError("unreachable", request=request)
+            return reply if isinstance(reply, httpx.Response) else httpx.Response(200, json=reply)
+
+        http = gtypes.HttpOptions(httpx_client=httpx.Client(transport=httpx.MockTransport(handler)),
+                                  retry_options=gtypes.HttpRetryOptions(attempts=1))
+        monkeypatch.setattr(critic, "_client_override", {"gemini": genai.Client(api_key="test-key", http_options=http)})
+        return seen
+    return install
+
+
+def test_gemini_request_shape_and_scoring(gemini, img):
+    seen = gemini(interaction(MESH_ANSWER))
+    p = {}
+    res = critic.critique_mesh(p, img)
+    req = seen[0]
+    assert req.url.path.endswith("/interactions") and req.headers["x-goog-api-key"] == "test-key"
+    body = json.loads(req.content)
+    assert body["model"] == config.CRITIC["models"]["gemini"] == "gemini-4-argon"
+    assert body["store"] is False  # the interaction is not kept server side
+    assert body["response_format"] == {"type": "text", "mime_type": "application/json", "schema": critic.MESH_SCHEMA}
+    assert body["generation_config"] == {"thinking_level": "medium", "max_output_tokens": 16000}
+    assert body["input"][0]["type"] == "user_input"
+    parts = body["input"][0]["content"]
+    assert [x["type"] for x in parts] == ["text", "image"] and parts[0]["text"] == critic.MESH_PROMPT
+    assert parts[1]["mime_type"] == "image/png"
+    sent = cv2.imdecode(np.frombuffer(base64.b64decode(parts[1]["data"]), np.uint8), cv2.IMREAD_UNCHANGED)
+    assert max(sent.shape[:2]) <= config.CRITIC["max_image_px"] and sent.shape[2] == 3  # downscaled, alpha flattened
+    assert res["scores"]["anatomy"] == 10.0 and res["issues"] == ["front: left hand fused to the hip"]
+    assert res["usage"] == {"backend": "gemini", "model": "gemini-4-argon", "input_tokens": 2100,
+                            "output_tokens": 180, "thought_tokens": 900}
+    assert p["critic_calls"] == 1
+
+
+def test_gemini_motion_sends_one_image_per_clip(gemini, img):
+    seen = gemini(interaction({
+        "clips": [{"name": n, "scores": {"pose": 8, "clipping": 8, "deformation": 8, "secondary": 8}, "issues": []} for n in ("walk", "wave")],
+        "summary": "ok",
+    }))
+    res = critic.critique_motion({}, {"walk": img, "wave": img})
+    body = json.loads(seen[0].content)
+    parts = body["input"][0]["content"]
+    assert [x["type"] for x in parts] == ["text", "image", "image"] and parts[0]["text"].endswith("walk, wave.")
+    assert body["response_format"]["schema"] == critic.MOTION_SCHEMA
+    assert set(res["clips"]) == {"walk", "wave"} and res["clips"]["walk"]["overall"] == 8.0
+
+
+def test_project_can_pick_another_gemini_model(gemini, img):
+    seen = gemini(interaction(MESH_ANSWER))
+    critic.critique_mesh({"critic_params": {"models": {"gemini": "gemini-3.8-flash"}, "effort": "high"}}, img)
+    body = json.loads(seen[0].content)
+    assert body["model"] == "gemini-3.8-flash" and body["generation_config"]["thinking_level"] == "high"
+
+
+@pytest.mark.parametrize("reply, reason", [
+    (interaction(status="incomplete", text=""), r"did not finish \(status: incomplete\)"),
+    (interaction(status="failed", text="", errors=[{"code": "blocked", "message": "image blocked"}]), "status: failed; image blocked"),
+    (interaction(text="not json"), "not valid JSON"),
+    (api_error(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key."), "key was rejected"),
+    (api_error(404, "NOT_FOUND", "models/gemini-4-argon is not found"), "gemini-4-argon is not available"),
+    (api_error(429, "RESOURCE_EXHAUSTED", "Quota exceeded"), "rate limit or quota"),
+    (api_error(500, "INTERNAL", "boom"), "Gemini API error 500"),
+    ("network", "network error"),
+])
+def test_gemini_failures_map_to_short_reasons(gemini, img, reply, reason):
+    gemini(reply)
+    p = {}
+    with pytest.raises(critic.CriticFailed, match=reason):
+        critic.critique_mesh(p, img)
+    assert p["critic_calls"] == 1  # the call was made, so it counts against the budget
+
+
+def test_backend_choice(monkeypatch):
+    monkeypatch.delenv("CHARFORGE_CRITIC", raising=False)
+    monkeypatch.delenv("CHARFORGE_CRITIC_BACKEND", raising=False)
+    keys = {"gemini": False, "claude": False}
+    installed = {"gemini": True, "claude": True}
+    monkeypatch.setattr(critic, "_client_override", {})
+    monkeypatch.setattr(critic, "_sdk", lambda b: types.SimpleNamespace() if installed[b] else None)
+    monkeypatch.setattr(critic, "_has_credentials", lambda b: keys[b])
+    with pytest.raises(critic.CriticUnavailable, match="GEMINI_API_KEY"):  # SDKs installed, no key: say which key
+        critic.check({})
+    keys["claude"] = True
+    assert critic.check({}) == "claude"
+    keys["gemini"] = True
+    assert critic.check({}) == "gemini"  # both ready: Gemini comes first
+    monkeypatch.setenv("CHARFORGE_CRITIC_BACKEND", "claude")
+    assert critic.check({}) == "claude"
+    monkeypatch.setenv("CHARFORGE_CRITIC_BACKEND", "gemini")
+    keys["gemini"] = False
+    with pytest.raises(critic.CriticUnavailable, match="GEMINI_API_KEY"):
+        critic.check({})
+    monkeypatch.setenv("CHARFORGE_CRITIC", "on")  # on: try even without a key
+    assert critic.check({}) == "gemini"
+    installed["gemini"] = False
+    with pytest.raises(critic.CriticUnavailable, match="google-genai"):
+        critic.check({})
+    monkeypatch.delenv("CHARFORGE_CRITIC_BACKEND")
+    assert critic.check({}) == "claude"  # auto + on: the first backend whose SDK is installed
+    installed["claude"] = False
+    with pytest.raises(critic.CriticUnavailable, match="vision model"):
+        critic.check({})
+    s = critic.status()
+    assert s["backend"] is None and s["reason"].startswith("critic needs a vision model")
+    assert s["keys"] == {"gemini": False, "claude": True} and s["sdks"] == {"gemini": None, "claude": None}
 
 
 # ---------------------------------------------------------------- policy
@@ -235,8 +379,9 @@ def test_score_mesh_reports_integrity_and_critic(sheet_path, monkeypatch, fake):
 def test_score_mesh_without_critic_sdk_is_silent(sheet_path, monkeypatch):
     monkeypatch.setenv("CHARFORGE_LEVEL", "2")
     monkeypatch.delenv("CHARFORGE_CRITIC", raising=False)
-    monkeypatch.setattr(critic, "_client_override", None)
-    monkeypatch.setattr(critic, "_sdk", lambda: None)
+    monkeypatch.delenv("CHARFORGE_CRITIC_BACKEND", raising=False)
+    monkeypatch.setattr(critic, "_client_override", {})
+    monkeypatch.setattr(critic, "_sdk", lambda b: None)
     pid = server.project_create(sheet_path=str(sheet_path), name="NoCritic", height_cm=165.0)["project_id"]
     server.sheet_split(project_id=pid)
     pdir = state.project_dir(pid)
@@ -258,7 +403,7 @@ def test_score_mesh_without_critic_sdk_is_silent(sheet_path, monkeypatch):
 
     monkeypatch.setattr(blender, "run", run)
     res = server.score_mesh(project_id=pid, mesh_path="meshes/cand-1-meshy.glb")
-    assert res["ok"] and res["data"]["critic"]["skipped"].startswith("critic needs the anthropic SDK")
+    assert res["ok"] and res["data"]["critic"]["skipped"].startswith("critic needs a vision model")
     assert not any("critic" in w.lower() for w in res["warnings"])
 
 

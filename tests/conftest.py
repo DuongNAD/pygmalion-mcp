@@ -5,9 +5,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def tmp_home(tmp_path, monkeypatch):
-    """Every test gets its own project root and Level 1."""
+    """Every test gets its own project root, Level 1 and no paid critic calls (critic tests turn it back on)."""
     monkeypatch.setenv("CHARFORGE_HOME", str(tmp_path / "projects"))
     monkeypatch.setenv("CHARFORGE_LEVEL", "1")
+    monkeypatch.setenv("CHARFORGE_CRITIC", "off")
     return tmp_path / "projects"
 
 

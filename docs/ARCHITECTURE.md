@@ -23,7 +23,7 @@ Model điều phối có thể là model nhanh/rẻ (cỡ Flash), vì mọi quy�
 | Sinh mesh (L2) | Cloud image-to-3D multi-view: Tripo, Meshy, Rodin, Hunyuan3D (qua fal.ai) | Chất lượng tự động cao nhất hiện có. Máy Mac không có GPU NVIDIA nên không chạy local TRELLIS/Hunyuan3D | `blockout`: visual hull từ silhouette, không cần key, chất lượng thô |
 | Xử lý, render, rig, xuất | Blender 5.x headless (`bpy`) | Miễn phí, làm được mọi khâu, script hoá được, đã cài sẵn | trimesh/PyMeshLab cho thao tác nhẹ |
 | Chấm điểm | numpy + OpenCV + scikit-image; toàn vẹn hình học bằng bmesh/BVH trong Blender | Xác định, nhanh, không cần GPU | CLIP/DINO embedding |
-| Critic thị giác (tùy chọn) | Claude qua SDK `anthropic` (`critic.py`), structured output + fallback `"default"` | Độc lập với model điều phối, chấm mặt/texture/chuyển động mà số đo không thấy | Tắt (`CHARFORGE_CRITIC=off`) |
+| Critic thị giác (tùy chọn) | `critic.py`: Gemini `gemini-4-argon` (SDK `google-genai`, Interactions API, `store=false`) hoặc Claude `claude-opus-5-5` (SDK `anthropic`, fallback `"default"`); cả hai trả JSON theo schema | Độc lập với model điều phối, chấm mặt/texture/chuyển động mà số đo không thấy | Tắt (`CHARFORGE_CRITIC=off`) |
 
 ## 3. Pipeline
 ```
@@ -116,7 +116,7 @@ Mọi tool trả JSON: `{ok, project_id, data, warnings, next_action: {tool, arg
 5. `rotated_90`: front render giống side reference hơn front reference → cảnh báo, gọi lại với `rotate_z=90`.
 5b. **Khe hở tư thế** (`pose_gaps`): trên mask front canonical, dải 30–62% chiều cao phải có hàng mà run ngoài cùng mảnh như cánh tay (< 12% chiều cao) cách run kế tiếp ≥ `POSE_GAP_MIN` (1,2% chiều cao) ở ít nhất `POSE_ARM_BAND_MIN` (25%) số hàng; T-pose (sải tay > 0,75 chiều cao) coi như tách. Dải 72–92% phải có hai run quanh tâm cách nhau ≥ ngưỡng ở `POSE_LEG_BAND_MIN` (50%) số hàng. Áp cho sheet (`reference.pose`) và cho mesh (`scores[].pose`); `pose_mismatch` = phần sheet tách mà mesh dính.
 5c. **Toàn vẹn hình học** (`render_views.py --integrity` → `score.integrity_report`): mảnh vụn, phần bị tách khỏi thân (không cắt vào và không gần bề mặt khối chính quá `gap_frac` × chiều cao), lỗ hở, cạnh non-manifold, tam giác tự cắt trong cùng một mảnh. Kiểm bằng số trước, rồi mới tới kiểm bằng mắt. Phần bị tách hoặc tự cắt nhiều làm `integrity.ok = false` và mesh đó xếp sau mesh lành trong số các mesh đã passed.
-5d. **Critic thị giác độc lập** (`critic.py`, chỉ mesh provider đã passed và các clip animation): Claude nhận ảnh sheet | render màu (hoặc contact sheet clip) cùng một rubric cố định, trả điểm 0–10 theo tiêu chí và lỗi cụ thể bằng structured output. Model điều phối không bao giờ tự chấm sản phẩm của mình. Critic không đổi `passed` và không kích hoạt sinh lại; nó chỉ quyết định giữa hai mesh đã passed khi chênh ≥ 1 điểm, và cảnh báo. Có ngân sách lượt gọi theo project.
+5d. **Critic thị giác độc lập** (`critic.py`, chỉ mesh provider đã passed và các clip animation): model critic (mặc định Gemini, hoặc Claude; `CRITIC.backend` = auto chọn backend đầu tiên có SDK và API key) nhận ảnh sheet | render màu (hoặc contact sheet clip) cùng một rubric cố định, trả điểm 0–10 theo tiêu chí và lỗi cụ thể bằng structured output. Model điều phối không bao giờ tự chấm sản phẩm của mình. Critic không đổi `passed` và không kích hoạt sinh lại; nó chỉ quyết định giữa hai mesh đã passed khi chênh ≥ 1 điểm, và cảnh báo. Có ngân sách lượt gọi theo project.
 6. **Dừng**: passed | `MAX_ITERATIONS=8` | plateau (3 lần chấm gần nhất cải thiện best < 0.005). Khi dừng vẫn đi tiếp với best, nên lúc nào cũng có output.
 
 ## 9. Quy ước toạ độ
@@ -131,6 +131,6 @@ Z-up, đơn vị mét, nhân vật nhìn về −Y (mặc định khi Blender im
 - Tay sát thân hoặc hai đùi dính nhau trên mesh vẫn làm rò trọng số ở chỗ tiếp xúc; QA phát hiện, sửa phần rò "xa" và báo vùng tiếp xúc, nhưng không tách được hình học đã dính. Sheet A-pose có khe hở rõ dưới nách và giữa hai chân quan trọng ngang code (đã cảnh báo từ `sheet_split`).
 - Animation gắn với khung xương của rig (Meshy hoặc rig offline). `export/<id>-humanoid.json` cho bản đồ vai trò → tên xương (kèm tên Mixamo) để retarget trong Unity/UE/Blender; tư thế nghỉ là A-pose nên công cụ retarget phải bù khác biệt với clip T-pose.
 - Nhánh offline (Blender procedural) đã tách khỏi tên xương và có dáng đi đầy đủ pha, nhưng vẫn là keyframe công thức: kém tự nhiên hơn thư viện preset hay Text to Motion của Meshy.
-- Điểm silhouette không đánh giá được mặt và biểu cảm. Muốn kiểm tra mặt thì thêm VLM judge (tùy chọn, ngoài roadmap).
+- Điểm silhouette không đánh giá được mặt và biểu cảm. Phần này do critic thị giác (5d) chấm, nếu được bật.
 - Critic thị giác là một model, không phải phép đo: điểm có thể dao động giữa các lần gọi. Vì vậy nó chỉ tư vấn và chỉ quyết định khi chênh rõ (≥ 1 điểm).
-- Ảnh có watermark của tác giả (ví dụ @higgs.osiris). Muốn dùng thương mại thì cần xin phép. Ảnh sẽ được gửi lên provider cloud khi dùng L2, và lên Claude API khi bật critic.
+- Ảnh có watermark của tác giả (ví dụ @higgs.osiris). Muốn dùng thương mại thì cần xin phép. Ảnh sẽ được gửi lên provider cloud khi dùng L2, và lên Gemini API hoặc Claude API khi bật critic.
