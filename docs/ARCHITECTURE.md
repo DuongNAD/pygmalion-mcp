@@ -13,6 +13,8 @@ Model điều phối có thể là model nhanh/rẻ (cỡ Flash), vì mọi quy�
 | Mất mạch khi pipeline dài | Trạng thái nằm trong `project.json`, tool nào cũng nhận `project_id` |
 | Gọi sai tham số | Ít tool, kiểu `Literal`/`pattern`/min-max, lỗi trả kèm `fix` |
 | Lặp vô hạn | Ngân sách `MAX_ITERATIONS=8`, dừng khi plateau, vẫn xuất best |
+| Tự viết keyframe animation (dính, giật) | Không có tool keyframe; preset Meshy, `animate(motions=[…])` (Text to Motion) hoặc procedural có sẵn |
+| Không biết rig có "dính" không | `auto_rig` tự vung tay/đùi đo rò trọng số, tự sửa; `animate` render frame từng clip + đo độ giãn bề mặt |
 
 ## 2. Chọn framework
 | Khâu | Chọn | Lý do | Phương án thay thế |
@@ -36,11 +38,19 @@ sheet.png ─ sheet_split ─► views/{front,side,back}.png + *_mask.png + refe
                                    ▼
    (blockout: mesh_optimize) ─► mesh_export (provider: tự chuẩn hóa rigid trước khi xuất GLB/FBX) ─► (L3) auto_rig ─► animate
 (L3) pipeline_run: chạy toàn bộ vòng trên bằng code, trả kết quả theo từng lát thời gian (status running → gọi lại)
+
+Cổng chất lượng của L3 (không thêm tool, nằm trong auto_rig/animate):
+  auto_rig ─► rig_check (vung tay/đùi 40°, đo vùng phải đứng yên, đo khe hở) ─ rớt ─► sửa trọng số ─► kiểm tra lại
+           └─► export/<id>-humanoid.json (bản đồ xương để retarget) + renders/qa/rig_check.json
+  animate  ─► (provider) ghép clip Text to Motion + chép trọng số đã sửa + chuyển động phụ (merge_animations --mode post)
+           ─► preview_clips: 6 frame × front/side mỗi clip → renders/anim/<clip>.png + stretch/ground metrics
 ```
 
 ## 4. Mô hình tiến trình
 - **MCP server**: Python 3.11, stdio, tool đồng bộ. `server.py` chỉ điều phối; logic nằm trong `state.py` (policy), `sheet.py`, `score.py`, `blender.py`.
 - **Blender**: mỗi lệnh là một subprocess `blender -b --factory-startup --python-exit-code 1 -P bpy_scripts/<x>.py -- --result <json> --key value…`. Script trong `bpy_scripts/` chạy bằng Python của Blender nên **chỉ import bpy/mathutils/stdlib**, không import `charforge`. Kết quả trả qua file `--result`: `{"ok": true, …}` hoặc `{"ok": false, "code", "message", "fix"}`. Không parse stdout.
+  - Hai module dùng chung nằm cùng thư mục và được import bằng `sys.path.insert(0, dirname(__file__))`: `cf_humanoid.py` (nhận diện vai trò xương theo cấu trúc, phân vùng đỉnh theo đoạn xương, phép thử biến dạng, đo tiếp xúc, sửa trọng số, bản đồ humanoid) và `cf_secondary.py` (phát hiện tóc/váy, chuỗi spring bone, mô phỏng và bake). Chúng cũng chỉ dùng bpy/mathutils/stdlib.
+  - Script L3: `rig.py` (rig offline + QA chỉ báo cáo), `rig_check.py` (QA + sửa cho rig bất kỳ), `merge_animations.py` (procedural / merge / rename / post), `preview_clips.py` (render frame từng clip + chỉ số chuyển động).
 - **Provider (L2/L3)**: gọi HTTP bằng `httpx` (đi kèm `mcp`). Job dài (`generate_mesh`, `auto_rig`, `animate`) không block quá ~55 s mà trả `status: "running"` + `job_id`, lưu job kèm `kind` bền vững (`multi-image-to-3d` / `image-to-3d` / `rigging` / `animations`) vào `project.json.jobs` để gọi lại ở lượt sau mà không phụ thuộc bộ nhớ tiến trình.
 
 ## 5. Dữ liệu
@@ -48,7 +58,10 @@ sheet.png ─ sheet_split ─► views/{front,side,back}.png + *_mask.png + refe
 projects/<id>/
   project.json      trạng thái (bên dưới)          calls.jsonl  mỗi lần gọi tool một dòng
   sheet.<ext>       ảnh gốc                         views/       front|side|back.png (RGBA), *_mask.png, preview.jpg, reference.json
-  meshes/           ứng viên, bản fit/optimize/export          renders/<mesh-stem>/  {view}_mask|color.png, {view}_diff.png, compare_*.png
+  meshes/           ứng viên, bản fit/optimize/export, <id>-rigged-provider.glb (rig gốc trước khi sửa), <id>-anim-provider.glb, <id>-motion-*.glb
+  renders/<mesh-stem>/  {view}_mask|color.png, {view}_diff.png, compare_*.png
+  renders/qa/rig_check.json   báo cáo đầy đủ của kiểm tra biến dạng      renders/anim/<clip>.png   preview front+side từng clip
+  export/           <id>.glb|.fbx, <id>-rigged.glb, <id>-humanoid.json, <id>-animated.glb
 ```
 Các trường của `project.json` (schema_version 1):
 
@@ -57,13 +70,17 @@ Các trường của `project.json` (schema_version 1):
 | `id`, `name`, `height_cm` | định danh, chiều cao thật để scale khi export |
 | `stage` | `created → views_ready → scored ⇄ … → passed/stopped → optimized → exported → rigged → animated` |
 | `views` | `{view: {"image", "mask"}}` (đường dẫn tương đối project) |
-| `reference` | `aspect`, `profile`, `neck_ratio`, `palette` (xem L1-T2) |
+| `reference` | `aspect`, `profile`, `neck_ratio`, `palette` (xem L1-T2), `pose` (khe hở tay–thân, chân–chân trên silhouette front) |
 | `thresholds`, `weights` | ngưỡng IoU, trọng số view (copy từ `config.py`, sửa theo từng project được) |
+| `rig_check_thresholds`, `anim_check_thresholds`, `anim_preview`, `secondary_params` | (tùy chọn) ghi đè `config.RIG_CHECK`, `ANIM_CHECK`, `ANIM_PREVIEW`, `SECONDARY` cho riêng project |
 | `meshes[]` | `{path, source: external/blockout/meshy/tripo/…/fit/optimized/export, derived_from, task_id, rotate_z, created_at, …}` |
-| `scores[]` | mỗi lần `score_mesh`: `{mesh, total, passed, iou, worst_bands, hints, …, at}` |
-| `best` | `{mesh, total, passed}` của lần chấm tốt nhất trong pha tìm kiếm |
-| `jobs` | job provider đang chạy: `{job_id: {provider, kind, started_at, ...}}` |
-| `outputs` | `{optimized, glb, fbx, rigged, animated, rig_task_id, basic_animations}` |
+| `scores[]` | mỗi lần `score_mesh`: `{mesh, total, passed, iou, worst_bands, hints, pose, pose_mismatch, …, at}` |
+| `best` | `{mesh, total, passed, pose_mismatch?}` của lần chấm tốt nhất trong pha tìm kiếm |
+| `pose_retries` | số ứng viên đã sinh thêm vì mesh dính tay/chân mà sheet tách rời (tối đa `config.POSE_RETRY`) |
+| `jobs` | job provider đang chạy: `{job_id: {provider, kind, started_at, ...}}`; `kind="animate-group"` gom preset + Text to Motion (`parts`) |
+| `outputs` | `{optimized, glb, fbx, rigged, rigged_provider, rig_repaired, humanoid, animated, previews, rig_task_id, basic_animations}` |
+| `qa` | `{rig: tóm tắt rig_check, motion: tóm tắt motion_check}` |
+| `animations` | `[{name, action_id? \| prompt + motion_task_id}]` |
 | `stop_reason` | `null` / `budget` / `plateau` |
 
 ## 6. Policy: stage → next_action (`state.suggest_next`)
@@ -79,6 +96,8 @@ Các trường của `project.json` (schema_version 1):
 
 `record_score` chỉ đổi stage khi đang ở pha tìm kiếm (`views_ready/scored/passed/stopped`). Lần chấm kiểm tra sau optimize chỉ được ghi lại.
 
+Xếp hạng `best`: `(passed, tư thế sạch nếu đã passed, total)`. Tư thế sạch nghĩa là mesh không dính phần mà sheet tách rời (`pose_mismatch` rỗng): tay dính thân làm rig rò trọng số, đáng giá hơn vài phần trăm IoU. Khi `best` của provider đã passed mà vẫn dính, còn ngân sách ứng viên và `pose_retries < POSE_RETRY` (1): stage về `scored` và `next_action` là `generate_mesh` với lý do nêu phần bị dính. Sheet tự nó đã dính thì không sinh thêm (sinh lại cũng vậy), chỉ cảnh báo.
+
 ## 7. Envelope và lỗi
 Mọi tool trả JSON: `{ok, project_id, data, warnings, next_action: {tool, args, why} | null, error: {code, message, fix} | null}`.
 - Lỗi agent sửa được: `raise CFError(code, message, fix)`. `fix` phải là một hành động cụ thể.
@@ -93,6 +112,7 @@ Mọi tool trả JSON: `{ok, project_id, data, warnings, next_action: {tool, arg
    - Với mesh từ provider (`meshy`, `tripo`, `rodin`, `hunyuan`): 3 view trên sheet 2D không đồng nhất hình học 100%, nên `passed` khi `total >= PROVIDER_ACCEPT_TOTAL` (0.80) và số mặt `tris <= MAX_PROVIDER_TRIS` (300.000).
 4. **Width profile** 64 dải ngang → `worst_bands` (dải lệch nhiều nhất, có vùng head/torso/hips-skirt/legs) → `hints` dạng câu lệnh.
 5. `rotated_90`: front render giống side reference hơn front reference → cảnh báo, gọi lại với `rotate_z=90`.
+5b. **Khe hở tư thế** (`pose_gaps`): trên mask front canonical, dải 30–62% chiều cao phải có hàng mà run ngoài cùng mảnh như cánh tay (< 12% chiều cao) cách run kế tiếp ≥ `POSE_GAP_MIN` (1,2% chiều cao) ở ít nhất `POSE_ARM_BAND_MIN` (25%) số hàng; T-pose (sải tay > 0,75 chiều cao) coi như tách. Dải 72–92% phải có hai run quanh tâm cách nhau ≥ ngưỡng ở `POSE_LEG_BAND_MIN` (50%) số hàng. Áp cho sheet (`reference.pose`) và cho mesh (`scores[].pose`); `pose_mismatch` = phần sheet tách mà mesh dính.
 6. **Dừng**: passed | `MAX_ITERATIONS=8` | plateau (3 lần chấm gần nhất cải thiện best < 0.005). Khi dừng vẫn đi tiếp với best, nên lúc nào cũng có output.
 
 ## 9. Quy ước toạ độ
@@ -102,6 +122,10 @@ Z-up, đơn vị mét, nhân vật nhìn về −Y (mặc định khi Blender im
 `calls.jsonl` ghi `{t, tool, args, ok, code, sec}` cho mỗi lần gọi. `project_status.data.stats` trả `calls, errors, error_rate, error_codes, iterations, best_total, passed`. Để so model (ví dụ Flash với model mạnh hơn): chạy N lần trên cùng sheet, so `error_rate`, số vòng đến khi passed, tỷ lệ passed, tổng thời gian (L3-T3).
 
 ## 11. Giới hạn của tự động 100%
-- Chất lượng tối đa phụ thuộc provider. Tóc và váy thường bị "đúc" liền khối, không có hair cards hay cloth sim như làm tay.
+- Chất lượng tối đa phụ thuộc provider. Tóc và váy bị "đúc" liền khối với thân. `animate(secondary="auto")` thêm chuỗi spring bone đã bake (tóc đuôi ngựa/tóc dài sau lưng, váy quanh hông, va chạm capsule với chân và thân) nên có độ trễ và lắc theo quán tính, nhưng không phải cloth sim thật: không có nếp gấp vải, va chạm chỉ xấp xỉ, tóc hai bên mặt và áo choàng rộng có thể không được nhận ra.
+- Không có rig mặt hay blendshape: mesh sinh ra thường vẽ mắt/miệng lên texture, không có hình học để tạo biểu cảm hay nhép miệng. Cần mesh có mặt mô hình hóa riêng hoặc làm tay.
+- Tay sát thân hoặc hai đùi dính nhau trên mesh vẫn làm rò trọng số ở chỗ tiếp xúc; QA phát hiện, sửa phần rò "xa" và báo vùng tiếp xúc, nhưng không tách được hình học đã dính. Sheet A-pose có khe hở rõ dưới nách và giữa hai chân quan trọng ngang code (đã cảnh báo từ `sheet_split`).
+- Animation gắn với khung xương của rig (Meshy hoặc rig offline). `export/<id>-humanoid.json` cho bản đồ vai trò → tên xương (kèm tên Mixamo) để retarget trong Unity/UE/Blender; tư thế nghỉ là A-pose nên công cụ retarget phải bù khác biệt với clip T-pose.
+- Nhánh offline (Blender procedural) đã tách khỏi tên xương và có dáng đi đầy đủ pha, nhưng vẫn là keyframe công thức: kém tự nhiên hơn thư viện preset hay Text to Motion của Meshy.
 - Điểm silhouette không đánh giá được mặt và biểu cảm. Muốn kiểm tra mặt thì thêm VLM judge (tùy chọn, ngoài roadmap).
 - Ảnh có watermark của tác giả (ví dụ @higgs.osiris). Muốn dùng thương mại thì cần xin phép. Ảnh sẽ được gửi lên provider cloud khi dùng L2.

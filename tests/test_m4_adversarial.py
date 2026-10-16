@@ -15,12 +15,11 @@ Adversarially challenges and stress-tests:
    - Exact count verification (assert len(animations) == len(requested_actions))
    - Rejection on dropped or extra actions (clip count mismatch detection)
    - Rejection on corrupt or truncated headers
-4. Procedural keyframing non-zero motion on Mixamo bones:
-   - Armature does NOT remain static across frames
-   - Idle: non-zero vertical oscillation on Hips, sway on Spine and Neck
-   - Walk: non-zero out-of-phase leg swings on LeftUpLeg/RightUpLeg, knee flexion, arm counter-swings, gait bounce
-   - Wave: non-zero arm elevation on RightArm, oscillation on RightForeArm/RightHand, return to rest
-   - Generic/custom action: non-zero motion on torso and limbs
+4. Procedural keyframing on a real humanoid rig, measured in world space:
+   - Idle: weight shift on Hips, head motion, seamless loop
+   - Walk: thighs swing >= 35 deg out of phase, knee flexion, arms counter-swing the opposite thigh, gait bounce
+   - Wave: right hand rises above the shoulder and returns
+   - Jump: crouch, then hips rise >= 15 cm
 5. Provider mode mock flow with simulated HTTP errors:
    - HTTP 404, 500 on submit_animation
    - HTTP 500 on status polling
@@ -111,101 +110,38 @@ bpy.ops.export_scene.gltf(filepath=r"{str(path)}", export_format="GLB")
     subprocess.run([exe, "-b", "--factory-startup", "--python-expr", script], check=True, capture_output=True)
 
 
-def inspect_glb_bone_motion_in_blender(glb_path: Path, result_json_path: Path) -> dict[str, Any]:
-    """Execute headless Blender to load GLB and evaluate bone motion across frames."""
+def sample_world_kinematics(glb_path: Path, result_json_path: Path) -> dict[str, Any]:
+    """Headless Blender: per action and frame, world-space joint positions of the key bones (found by Mixamo name)."""
     exe = config.blender_exe()
     if not exe:
         pytest.skip("Blender executable not available.")
-
     script = f"""
 import json, bpy
-from mathutils import Vector
-
 bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.context.scene.render.fps = 30
 bpy.ops.import_scene.gltf(filepath=r"{str(glb_path)}")
-
-arm_objs = [o for o in bpy.context.scene.objects if o.type == 'ARMATURE']
-if not arm_objs:
-    raise RuntimeError("No armature in exported GLB")
-arm = arm_objs[0]
-
-results = {{"actions": {{}}}}
-
+arm = [o for o in bpy.context.scene.objects if o.type == 'ARMATURE'][0]
+ad = arm.animation_data
+for t in ad.nla_tracks:
+    t.mute = True
+names = ["Hips", "Spine2", "Head", "LeftUpLeg", "LeftLeg", "LeftFoot", "RightUpLeg", "RightLeg", "RightFoot",
+         "LeftArm", "LeftForeArm", "RightArm", "RightForeArm", "RightHand"]
+out = {{}}
 for act in bpy.data.actions:
-    act_info = {{
-        "name": act.name,
-        "frame_range": [float(act.frame_range[0]), float(act.frame_range[1])],
-        "bones": {{}}
-    }}
-    
-    if not arm.animation_data:
-        arm.animation_data_create()
-    arm.animation_data.use_nla = False
-    arm.animation_data.action = act
-    
-    # Track relevant Mixamo bones
-    target_bones = [
-        "Hips", "Spine", "Spine1", "Neck", "Head",
-        "LeftArm", "RightArm", "LeftForeArm", "RightForeArm", "LeftHand", "RightHand",
-        "LeftUpLeg", "RightUpLeg", "LeftLeg", "RightLeg"
-    ]
-    
-    start_frame = int(act.frame_range[0])
-    end_frame = int(act.frame_range[1])
-    
-    for bname in target_bones:
-        pb = arm.pose.bones.get(bname)
-        if not pb:
-            continue
-        
-        locs = []
-        rot_eulers = []
-        
-        for f in range(start_frame, end_frame + 1):
-            bpy.context.scene.frame_set(f)
-            locs.append(list(pb.location))
-            if pb.rotation_mode == "QUATERNION":
-                rot_eul = pb.rotation_quaternion.to_euler()
-            else:
-                rot_eul = pb.rotation_euler
-            rot_eulers.append([rot_eul.x, rot_eul.y, rot_eul.z])
-            
-        z_locs = [l[2] for l in locs]
-        rot_x = [r[0] for r in rot_eulers]
-        rot_y = [r[1] for r in rot_eulers]
-        rot_z = [r[2] for r in rot_eulers]
-        
-        act_info["bones"][bname] = {{
-            "delta_z": max(z_locs) - min(z_locs),
-            "delta_rot_x": max(rot_x) - min(rot_x),
-            "delta_rot_y": max(rot_y) - min(rot_y),
-            "delta_rot_z": max(rot_z) - min(rot_z),
-            "z_values": {{
-                "0": z_locs[0] if len(z_locs) > 0 else 0.0,
-                "15": z_locs[15] if len(z_locs) > 15 else 0.0,
-                "30": z_locs[30] if len(z_locs) > 30 else 0.0,
-            }},
-            "rot_x_values": {{
-                "0": rot_x[0] if len(rot_x) > 0 else 0.0,
-                "10": rot_x[10] if len(rot_x) > 10 else 0.0,
-                "20": rot_x[20] if len(rot_x) > 20 else 0.0,
-            }},
-            "rot_z_values": {{
-                "0": rot_z[0] if len(rot_z) > 0 else 0.0,
-                "30": rot_z[30] if len(rot_z) > 30 else 0.0,
-                "60": rot_z[60] if len(rot_z) > 60 else 0.0,
-            }}
-        }}
-    
-    results["actions"][act.name] = act_info
-
-with open(r"{str(result_json_path)}", "w") as f:
-    json.dump(results, f)
+    ad.action = act
+    if getattr(ad, "action_slot", None) is None and len(getattr(act, "slots", [])):
+        ad.action_slot = act.slots[0]
+    f0, f1 = (int(round(x)) for x in act.frame_range)
+    frames = {{}}
+    for f in range(f0, f1 + 1):
+        bpy.context.scene.frame_set(f)
+        frames[f] = {{n: [list(arm.matrix_world @ arm.pose.bones[n].head), list(arm.matrix_world @ arm.pose.bones[n].tail)]
+                     for n in names if n in arm.pose.bones}}
+    out[act.name] = {{"range": [f0, f1], "frames": frames}}
+with open(r"{str(result_json_path)}", "w") as fh:
+    json.dump(out, fh)
 """
-    cmd = [exe, "-b", "--factory-startup", "--python-expr", script]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        raise RuntimeError(f"Blender motion inspection failed: {res.stderr}\n{res.stdout}")
+    subprocess.run([exe, "-b", "--factory-startup", "--python-exit-code", "1", "--python-expr", script], check=True, capture_output=True)
     return json.loads(result_json_path.read_text())
 
 
@@ -488,20 +424,51 @@ class TestGLBChunk0BinaryVerification:
 
 @pytest.mark.blender
 class TestProceduralMotionMixamoBones:
-    """Verify that procedural keyframing produces genuine non-zero bone kinematics."""
+    """Procedural keyframing on a real humanoid rig: measured in world space, so it holds for any bone roll/naming."""
+
+    @staticmethod
+    def _pitch(seg):
+        """Forward swing of a limb segment in degrees (0 = straight down, + = toward -Y, the character's front)."""
+        import math
+
+        (hx, hy, hz), (tx, ty, tz) = seg
+        return math.degrees(math.atan2(-(ty - hy), -(tz - hz)))
+
+    @staticmethod
+    def _angle(a, b):
+        import math
+
+        va = [a[1][i] - a[0][i] for i in range(3)]
+        vb = [b[1][i] - b[0][i] for i in range(3)]
+        dot = sum(x * y for x, y in zip(va, vb))
+        na = math.sqrt(sum(x * x for x in va)) or 1.0
+        nb = math.sqrt(sum(x * x for x in vb)) or 1.0
+        return math.degrees(math.acos(max(-1.0, min(1.0, dot / (na * nb)))))
+
+    @staticmethod
+    def _corr(xs, ys):
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        sx = sum((x - mx) ** 2 for x in xs) ** 0.5 or 1e-9
+        sy = sum((y - my) ** 2 for y in ys) ** 0.5 or 1e-9
+        return sxy / (sx * sy)
 
     def test_procedural_motion_amplitude_and_kinematics(self, tmp_path, monkeypatch):
-        """Test idle, walk, wave, jump: verify Mixamo bones exhibit expected non-zero ranges."""
+        """idle breathes and loops; walk swings the thighs out of phase with knee flexion and counter-swinging
+        arms; wave lifts the right hand above the shoulder and brings it back; jump lifts the hips."""
+        from tests.bpy_fixtures import make_character
+
         monkeypatch.setenv("CHARFORGE_LEVEL", "3")
         sheet = tmp_path / "sheet.png"
         sheet.write_bytes(b"dummy")
-        cr = server.project_create(sheet_path=str(sheet), name="KinematicsCheck", height_cm=165.0)
+        cr = server.project_create(sheet_path=str(sheet), name="KinematicsCheck", height_cm=170.0)
         pid = cr["project_id"]
         pdir = state.project_dir(pid)
 
         rig_path = pdir / f"export/{pid}-rigged.glb"
         rig_path.parent.mkdir(parents=True, exist_ok=True)
-        create_minimal_rigged_glb(rig_path)
+        make_character(rig_path)
 
         p = state.load(pid)
         p["outputs"]["rigged"] = f"export/{pid}-rigged.glb"
@@ -509,117 +476,50 @@ class TestProceduralMotionMixamoBones:
         state.save(p)
 
         actions = ["idle", "walk", "wave", "jump"]
-        res = tools_full.animate(project_id=pid, actions=actions, method="blender")
-        assert res["ok"] is True
+        res = tools_full.animate(project_id=pid, actions=actions, method="blender", secondary="off")
+        assert res["ok"] is True, res
+        assert res["data"]["motion_check"]["passed"] is True, res["data"]["motion_check"]
 
         out_glb = pdir / res["data"]["mesh_path"]
-        assert out_glb.is_file()
+        clips = sample_world_kinematics(out_glb, tmp_path / "kin.json")
+        assert set(clips) == set(actions)
 
-        # Run headless Blender motion evaluator
-        results_json = tmp_path / "motion_results.json"
-        motion_data = inspect_glb_bone_motion_in_blender(out_glb, results_json)
+        def series(clip, bone, k=0):
+            fr = clips[clip]["frames"]
+            return [fr[f][bone][k] for f in sorted(fr, key=int)]
 
-        exported_actions = motion_data.get("actions", {})
-        assert len(exported_actions) == 4
+        # idle: subtle but real motion, seamless loop
+        hips = series("idle", "Hips")
+        assert max(abs(h[0] - hips[0][0]) for h in hips) > 0.003  # weight shift
+        head = [[h, t] for h, t in zip(series("idle", "Head", 0), series("idle", "Head", 1))]
+        assert max(self._angle(head[0], s) for s in head) > 1.0
+        assert all(abs(a - b) < 1e-3 for a, b in zip(hips[0], hips[-1]))
 
-        # ----------------------------------------------------------------------
-        # 1. Idle Action Checks:
-        # Subtle cyclic breathing: Hips displacement +-1.2 cm, Spine/Neck sway
-        # ----------------------------------------------------------------------
-        assert "idle" in exported_actions
-        idle_info = exported_actions["idle"]
-        assert idle_info["frame_range"] == [0.0, 60.0]
-        idle_bones = idle_info["bones"]
+        # walk: thighs swing >= 35 deg peak to peak, out of phase; knees bend; arms counter-swing the thighs
+        lt = [self._pitch(s) for s in zip(series("walk", "LeftUpLeg", 0), series("walk", "LeftUpLeg", 1))]
+        rt = [self._pitch(s) for s in zip(series("walk", "RightUpLeg", 0), series("walk", "RightUpLeg", 1))]
+        assert max(lt) - min(lt) >= 35 and max(rt) - min(rt) >= 35
+        assert self._corr(lt, rt) < -0.8
+        thigh = list(zip(series("walk", "LeftUpLeg", 0), series("walk", "LeftUpLeg", 1)))
+        shin = list(zip(series("walk", "LeftLeg", 0), series("walk", "LeftLeg", 1)))
+        assert max(self._angle(a, b) for a, b in zip(thigh, shin)) >= 40
+        la = [self._pitch(s) for s in zip(series("walk", "LeftArm", 0), series("walk", "LeftArm", 1))]
+        assert max(la) - min(la) >= 15
+        assert self._corr(la, rt) > 0.8  # left arm forward while the right thigh is forward
+        hz = [h[2] for h in series("walk", "Hips")]
+        assert max(hz) - min(hz) >= 0.01
 
-        # Hips vertical translation amplitude >= 0.02 m (theoretical peak-to-peak 0.024 m)
-        assert "Hips" in idle_bones
-        hips_disp = idle_bones["Hips"]["delta_z"]
-        assert hips_disp >= 0.015, f"Hips idle displacement {hips_disp} m too low (expected >= 0.015 m)"
+        # wave: right hand above the right shoulder mid-clip, back down at the end
+        hand = series("wave", "RightHand")
+        shoulder = series("wave", "RightArm")
+        mid = len(hand) // 2
+        assert hand[mid][2] > shoulder[mid][2] + 0.05
+        assert hand[0][2] < shoulder[0][2] and abs(hand[-1][2] - hand[0][2]) < 0.03
 
-        # Spine / Spine1 rotational sway
-        spine_sway = idle_bones.get("Spine1", {}).get("delta_rot_x", 0.0) or idle_bones.get("Spine", {}).get("delta_rot_x", 0.0)
-        assert spine_sway >= 0.02, f"Spine idle sway {spine_sway} rad too low (expected >= 0.02 rad)"
-
-        # Neck sway
-        assert "Neck" in idle_bones
-        neck_sway = idle_bones["Neck"]["delta_rot_x"]
-        assert neck_sway >= 0.015, f"Neck idle sway {neck_sway} rad too low (expected >= 0.015 rad)"
-
-        # ----------------------------------------------------------------------
-        # 2. Walk Action Checks:
-        # 40 frames, cyclic leg swings +-0.35 rad, knee flexion, counter-swings
-        # ----------------------------------------------------------------------
-        assert "walk" in exported_actions
-        walk_info = exported_actions["walk"]
-        assert walk_info["frame_range"] == [0.0, 40.0]
-        walk_bones = walk_info["bones"]
-
-        # LeftUpLeg and RightUpLeg swing
-        assert "LeftUpLeg" in walk_bones and "RightUpLeg" in walk_bones
-        l_leg_swing = walk_bones["LeftUpLeg"]["delta_rot_x"]
-        r_leg_swing = walk_bones["RightUpLeg"]["delta_rot_x"]
-        assert l_leg_swing >= 0.5, f"LeftUpLeg swing {l_leg_swing} rad too low (expected >= 0.5 rad)"
-        assert r_leg_swing >= 0.5, f"RightUpLeg swing {r_leg_swing} rad too low (expected >= 0.5 rad)"
-
-        # 180° out-of-phase check at frame 10 (quarter-cycle)
-        l_rot_10 = walk_bones["LeftUpLeg"]["rot_x_values"]["10"]
-        r_rot_10 = walk_bones["RightUpLeg"]["rot_x_values"]["10"]
-        assert (l_rot_10 * r_rot_10) < 0.0, f"Expected out-of-phase leg swing at frame 10, got Left={l_rot_10}, Right={r_rot_10}"
-
-        # Knee flexion during backswing
-        assert "LeftLeg" in walk_bones and "RightLeg" in walk_bones
-        l_knee = walk_bones["LeftLeg"]["delta_rot_x"]
-        r_knee = walk_bones["RightLeg"]["delta_rot_x"]
-        assert l_knee >= 0.35, f"LeftLeg knee flexion {l_knee} rad too low"
-        assert r_knee >= 0.35, f"RightLeg knee flexion {r_knee} rad too low"
-
-        # Arm counter-swings
-        assert "LeftArm" in walk_bones and "RightArm" in walk_bones
-        l_arm = walk_bones["LeftArm"]["delta_rot_x"]
-        r_arm = walk_bones["RightArm"]["delta_rot_x"]
-        assert l_arm >= 0.4, f"LeftArm counter-swing {l_arm} rad too low"
-        assert r_arm >= 0.4, f"RightArm counter-swing {r_arm} rad too low"
-
-        # Gait bounce on Hips
-        hips_bounce = walk_bones["Hips"]["delta_z"]
-        assert hips_bounce >= 0.010, f"Hips walk bounce {hips_bounce} m too low"
-
-        # ----------------------------------------------------------------------
-        # 3. Wave Action Checks:
-        # Arm raise to 1.2 rad, waving oscillation +-0.4 rad, return to rest
-        # ----------------------------------------------------------------------
-        assert "wave" in exported_actions
-        wave_info = exported_actions["wave"]
-        assert wave_info["frame_range"] == [0.0, 60.0]
-        wave_bones = wave_info["bones"]
-
-        # RightArm elevation
-        assert "RightArm" in wave_bones
-        arm_elev_delta = wave_bones["RightArm"]["delta_rot_z"]
-        assert arm_elev_delta >= 1.0, f"RightArm wave elevation {arm_elev_delta} rad too low (expected >= 1.0 rad)"
-
-        # RightArm returns to rest at f=60
-        r_rot_0 = wave_bones["RightArm"]["rot_z_values"]["0"]
-        r_rot_30 = wave_bones["RightArm"]["rot_z_values"]["30"]
-        r_rot_60 = wave_bones["RightArm"]["rot_z_values"]["60"]
-        assert abs(r_rot_0) < 0.05
-        assert r_rot_30 >= 1.1, f"RightArm not raised at mid-cycle (got {r_rot_30} rad)"
-        assert abs(r_rot_60) < 0.05, f"RightArm did not return to rest at frame 60 (got {r_rot_60} rad)"
-
-        # Forearm / Hand waving oscillation
-        assert "RightForeArm" in wave_bones
-        forearm_osc = wave_bones["RightForeArm"]["delta_rot_y"]
-        assert forearm_osc >= 0.6, f"RightForeArm wave oscillation {forearm_osc} rad too low (expected >= 0.6 rad)"
-
-        # ----------------------------------------------------------------------
-        # 4. Generic/Custom Action ("jump"):
-        # Verifies generic fallback generates non-zero rhythmic limb/torso motion
-        # ----------------------------------------------------------------------
-        assert "jump" in exported_actions
-        jump_info = exported_actions["jump"]
-        jump_bones = jump_info["bones"]
-        assert jump_bones["Hips"]["delta_z"] >= 0.015, "Generic action Hips motion is zero"
-        assert jump_bones["LeftArm"]["delta_rot_x"] >= 0.3, "Generic action LeftArm motion is zero"
+        # jump: crouch, then the hips rise well above rest
+        jz = [h[2] for h in series("jump", "Hips")]
+        assert max(jz) - jz[0] >= 0.15
+        assert min(jz) < jz[0] - 0.05
 
 
 # ==============================================================================

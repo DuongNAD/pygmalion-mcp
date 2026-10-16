@@ -243,6 +243,7 @@ def reference_metrics(masks: dict[str, np.ndarray], front_rgb: np.ndarray) -> di
     profile[view] = score.width_profile(score.canonical_mask(mask))  (PROFILE_BINS floats)
     neck_ratio    = (argmin of the front profile within 8-30% height from the top + 0.5) / PROFILE_BINS
     palette       = 8 hex colors "#rrggbb": cv2.kmeans over front foreground pixels, sorted by cluster size
+    pose          = score.pose_gaps(front mask): are forearms/hands and shins visibly apart from the body
     """
     aspect = {}
     profile = {}
@@ -285,4 +286,5 @@ def reference_metrics(masks: dict[str, np.ndarray], front_rgb: np.ndarray) -> di
         "profile": profile,
         "neck_ratio": neck_ratio,
         "palette": palette,
+        "pose": score.pose_gaps(masks["front"]),
     }

@@ -240,17 +240,22 @@ def render_dir(p: dict, rpath: str) -> Path:
     return out
 
 
+def _rank(rec: dict) -> tuple:
+    """Best-mesh order: passed first; among passed meshes a clean pose (no arms/legs fused that the sheet
+    keeps apart) beats a few hundredths of silhouette IoU, because fused parts ruin the rig."""
+    passed = bool(rec.get("passed"))
+    return (passed, not rec.get("pose_mismatch") if passed else True, rec.get("total", 0.0))
+
+
 def record_score(p: dict, rec: dict) -> None:
     """Append a score ({mesh, total, passed, iou, ...}); in search stages update best/stage/stop_reason."""
     p["scores"].append({**rec, "at": _now()})
     if p["stage"] not in SEARCH_STAGES:
         return  # post-search check (e.g. after optimize): record only
-    if (
-        not p["best"]
-        or (rec["passed"] and not p["best"].get("passed"))
-        or (rec["passed"] == p["best"].get("passed") and rec["total"] > p["best"]["total"])
-    ):
+    if not p["best"] or _rank(rec) > _rank(p["best"]):
         p["best"] = {"mesh": rec["mesh"], "total": rec["total"], "passed": rec["passed"]}
+        if rec.get("pose_mismatch"):
+            p["best"]["pose_mismatch"] = rec["pose_mismatch"]
 
     # If mesh appears turned 90 degrees and hasn't been rotated yet, stay in 'scored' for re-scoring
     if rec.get("rotated_90") and rec.get("rotate_z", 0) == 0:
@@ -264,7 +269,18 @@ def record_score(p: dict, rec: dict) -> None:
     prov_mesh = is_provider_mesh(p, rec.get("mesh"))
 
     if p["best"]["passed"]:
-        p["stage"], p["stop_reason"] = "passed", None
+        retry = (
+            p["best"].get("pose_mismatch")
+            and is_provider_mesh(p, p["best"]["mesh"])
+            and p.get("pose_retries", 0) < config.POSE_RETRY
+            and n_cand < config.MAX_CANDIDATES
+            and len(totals) < config.MAX_ITERATIONS
+        )
+        if retry:  # the generator fused parts the sheet keeps apart: one more candidate for a clean rig
+            p["pose_retries"] = p.get("pose_retries", 0) + 1
+            p["stage"], p["stop_reason"] = "scored", None
+        else:
+            p["stage"], p["stop_reason"] = "passed", None
     elif prov_mesh and n_cand >= config.MAX_CANDIDATES:
         p["stage"], p["stop_reason"] = "stopped", "budget"
     elif len(totals) >= config.MAX_ITERATIONS:
@@ -291,6 +307,14 @@ def suggest_next(p: dict) -> dict | None:
         n_cand = sum(1 for m in p["meshes"] if m.get("source") not in DERIVED_SOURCES)
         if is_provider_mesh(p, best):
             last_sc = p["scores"][-1] if p.get("scores") else {}
+            if p["best"].get("passed") and p["best"].get("pose_mismatch") and n_cand < config.MAX_CANDIDATES:
+                parts = " and ".join(p["best"]["pose_mismatch"])
+                return action(
+                    "generate_mesh",
+                    f"Best mesh fuses the {parts} that the sheet keeps apart; one more candidate for a clean rig.",
+                    project_id=pid,
+                    provider="auto",
+                )
             if n_cand < config.MAX_CANDIDATES:
                 if last_sc.get("over_poly_budget"):
                     smaller_poly = max(5000, config.MESHY_TARGET_POLYCOUNT // 2)

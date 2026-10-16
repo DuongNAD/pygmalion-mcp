@@ -5,7 +5,10 @@ Conforms to official Meshy OpenAPI v1 specifications:
 - POST /openapi/v1/image-to-3d (single-view fallback)
 - POST /openapi/v1/rigging (humanoid rigging -> result.rigged_character_glb_url)
 - GET  /openapi/v1/animations/library (animation catalog with non-contiguous action_id)
-- POST /openapi/v1/animations (multi-action animation -> result.animation_glb_url)
+- POST /openapi/v1/animations (multi-action animation -> result.animation_glb_url; exactly one of
+  action_id | action_ids (1-10) | motion_task_id)
+- POST /openapi/v1/text-to-motion (prompt <= 400 chars, duration 2-10 s in 0.5 steps, mode prime|swift ->
+  result.motion_url; the clip lives 3 days and is applied with POST /animations {motion_task_id})
 """
 from __future__ import annotations
 
@@ -321,37 +324,96 @@ class MeshyProvider(Provider):
 
         return resolved
 
+    def submit_text_to_motion(self, prompt: str, duration: float | None = None, mode: str | None = None) -> str:
+        """Submit POST /openapi/v1/text-to-motion; returns the task id to apply with submit_animation(motion_task_id=...)."""
+        key = self._require_key()
+        text = (prompt or "").strip()
+        if not text:
+            raise CFError("ANIM_FAILED", "Text to Motion prompt is empty.", "Describe the motion in a short sentence.")
+        dur = float(duration if duration is not None else config.MESHY_MOTION_DURATION)
+        dur = max(2.0, min(10.0, round(dur * 2) / 2))  # 2-10 s in 0.5 s steps
+        payload = {"prompt": text[:400], "duration": dur, "mode": mode or config.MESHY_MOTION_MODE}
+        res = self.client.post(
+            "https://api.meshy.ai/openapi/v1/text-to-motion",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if res.status_code == 403:
+            raise CFError(
+                "ANIM_FAILED",
+                f"Meshy Text to Motion rejected the prompt (content moderation): {res.text}",
+                "Rephrase the motion prompt, or drop it from motions.",
+            )
+        try:
+            self._check_status(res)
+        except CFError as e:  # the generic fix talks about generate_mesh; give the animate-side one
+            raise CFError(e.code, e.message, "Drop motions (preset actions still work) or retry animate later.") from None
+        task_id = res.json().get("result")
+        if not task_id:
+            raise CFError("PROVIDER_FAILED", f"Meshy Text to Motion response missing result: {res.text}", "Drop motions and use preset actions.")
+        task_id_str = str(task_id)
+        self._job_types[task_id_str] = "text-to-motion"
+        self.last_submitted_kind = "text-to-motion"
+        return task_id_str
+
+    def poll_text_to_motion(self, task_id: str) -> dict:
+        """Poll GET /openapi/v1/text-to-motion/{task_id}; reads result.motion_url / motion_format."""
+        key = self._require_key()
+        res = self.client.get(
+            f"https://api.meshy.ai/openapi/v1/text-to-motion/{task_id}",
+            headers={"Authorization": f"Bearer {key}"},
+        )
+        self._check_status(res)
+        data = res.json()
+        status = data.get("status")
+        if status in ("PENDING", "IN_PROGRESS"):
+            return {"status": "running", "progress": data.get("progress", 0)}
+        if status == "SUCCEEDED":
+            res_obj = data.get("result") or {}
+            return {
+                "status": "done",
+                "url": res_obj.get("motion_url"),
+                "format": res_obj.get("motion_format"),
+                "duration_ms": res_obj.get("duration_ms"),
+                "consumed_credits": data.get("consumed_credits"),
+            }
+        if status in ("FAILED", "CANCELED", "EXPIRED"):
+            err = (data.get("task_error") or {}).get("message") or data.get("message") or f"Text to Motion task {status.lower()}"
+            return {"status": "failed", "error": err}
+        return {"status": "running"}
+
     def submit_animation(
         self,
         rig_task_id: str,
         action_ids: list[int] | None = None,
         action_id: int | None = None,
+        motion_task_id: str | None = None,
     ) -> str:
-        """Submit character animation task to POST /openapi/v1/animations with action_ids (1-10)."""
+        """Submit POST /openapi/v1/animations with exactly one of action_ids (1-10), action_id or motion_task_id."""
         key = self._require_key()
-        if action_ids is not None:
-            # Meshy requires 1..10 unique action_id values
-            unique_ids = list(dict.fromkeys(int(x) for x in action_ids))
-        elif action_id is not None:
-            unique_ids = [int(action_id)]
+        payload: dict[str, Any] = {"rig_task_id": rig_task_id}
+        if motion_task_id:
+            payload["motion_task_id"] = str(motion_task_id)
         else:
-            raise CFError(
-                "PROVIDER_FAILED",
-                "Meshy submit_animation requires action_ids.",
-                "Pass 1 to 10 action names to animate.",
-            )
+            if action_ids is not None:
+                # Meshy requires 1..10 unique action_id values
+                unique_ids = list(dict.fromkeys(int(x) for x in action_ids))
+            elif action_id is not None:
+                unique_ids = [int(action_id)]
+            else:
+                raise CFError(
+                    "PROVIDER_FAILED",
+                    "Meshy submit_animation requires action_ids.",
+                    "Pass 1 to 10 action names to animate.",
+                )
 
-        if not (1 <= len(unique_ids) <= 10):
-            raise CFError(
-                "ANIM_FAILED",
-                f"Meshy animation supports 1 to 10 unique action_ids per task, got {len(unique_ids)}.",
-                "Pass between 1 and 10 actions.",
-            )
-
-        payload: dict[str, Any] = {
-            "rig_task_id": rig_task_id,
-            "action_ids": unique_ids,
-        }
+            if not (1 <= len(unique_ids) <= 10):
+                raise CFError(
+                    "ANIM_FAILED",
+                    f"Meshy animation supports 1 to 10 unique action_ids per task, got {len(unique_ids)}.",
+                    "Pass between 1 and 10 actions.",
+                )
+            payload["action_ids"] = unique_ids
         res = self.client.post(
             "https://api.meshy.ai/openapi/v1/animations",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -435,6 +497,8 @@ class MeshyProvider(Provider):
             return self.poll_rig(job_id)
         if effective_kind == "animations":
             return self.poll_animation(job_id)
+        if effective_kind == "text-to-motion":
+            return self.poll_text_to_motion(job_id)
 
         key = self._require_key()
 

@@ -28,34 +28,42 @@ Toàn bộ quy trình từ ảnh turnaround 2D phẳng đến model 3D rigged & 
 |---|---|---|
 | **L1 – Mắt** | `project_create`, `project_status`, `sheet_split`, `render_views`, `score_mesh` | Đã hoàn thành & kiểm thử 100% (Blender headless + OpenCV/NumPy) |
 | **L2 – Tay** | `generate_mesh` (Tripo/Meshy/Rodin/Hunyuan hoặc visual-hull `blockout`), `mesh_fit`, `mesh_optimize`, `mesh_export` | Đã hoàn thành & kiểm thử 100% (Lattice fitting, decimate, bounding box safety) |
-| **L3 – Hoàn thiện** | `auto_rig` (22 xương Mixamo), `animate` (hoạt hóa đa action), `pipeline_run` (tự hành toàn trình) | Đã hoàn thành & kiểm thử 100% (Medial-axis rigging, multi-clip GLB merging) |
+| **L3 – Hoàn thiện** | `auto_rig` (rig + kiểm tra biến dạng + tự sửa trọng số), `animate` (preset/Text to Motion/procedural + chuyển động phụ + preview), `pipeline_run` (tự hành toàn trình) | Đã hoàn thành & kiểm thử (rig QA, multi-clip GLB, spring bones) |
 
 ---
 
 ## Chi Tiết Công Cụ Level 3
 
 ### `auto_rig(project_id, mesh_path=None, method="auto")`
-- **Armature Mixamo 22 xương**: Tự động xác định các khớp vai, khuỷu tay, cổ tay, hông, đầu gối, mắt cá dựa trên trục trung tâm hình học (medial-axis cross-sectional centroids) với độ chính xác <= 8 cm trên cả 3 tư thế (T-pose, A-pose 45°, arms-down 80°).
-- **Chống rò rỉ trọng số (Weight Leakage Prevention)**:
-  * Pre-bind seam welding (`remove_doubles`) hàn kín các seam UV trước khi tính toán bone heat.
-  * Bắt cảnh báo `Bone Heat Weighting: failed` từ Blender C stderr và chuyển sang thuật toán hai tầng: Geodesic BFS edge diffusion + bilateral corridor IDW.
-  * Tự kiểm tra biến dạng: xoay `LeftArm` 40°, chuyển vị tay > 10 cm trong khi vùng đùi và thân dưới chuyển vị < 0.5 cm.
-- **Tích hợp Cloud**: Hỗ trợ Meshy Rigging API (`POST /openapi/v1/rigging`) khi có `MESHY_API_KEY`.
-- Kết quả: `export/<id>-rigged.glb` · `next_action`: `animate`.
+- **Rig**: ưu tiên Meshy Rigging API (`POST /openapi/v1/rigging`) khi có `MESHY_API_KEY` và mesh gốc từ Meshy; không có thì rig offline trong Blender (22 xương Mixamo, khớp xác định bằng medial-axis, hành lang chi chống rò trọng số).
+- **Kiểm tra biến dạng cho mọi rig (`pose_deformation_check`)**:
+  * Nhận diện vai trò xương từ cấu trúc cây xương và vị trí khớp, không tin tên: chạy với tên Mixamo, UE (`upperarm_l`) hay tên vô nghĩa.
+  * Vung từng cánh tay 40° (ra trước, giơ ngang) và từng đùi 40° (ra trước), đo xem đùi, thân, đầu và chi còn lại có bị kéo theo không. Vùng cơ thể của đỉnh lấy theo khoảng cách tới đoạn xương, không dùng trọng số đang bị kiểm tra.
+  * Đo tiếp xúc: cẳng tay/bàn tay dính thân hay đùi, hai ống chân dính nhau (váy nối hai chân không bị tính nhầm).
+  * Rig Meshy rớt kiểm tra → **tự sửa trọng số** (tay không kéo chân/thân/váy, chân không kéo tay…), kiểm tra lại, chỉ giữ khi tốt hơn. Rig gốc của Meshy được giữ ở `meshes/<id>-rigged-provider.glb`.
+- **Bản đồ humanoid** `export/<id>-humanoid.json`: vai trò → tên xương + tên Mixamo tương ứng, để retarget sang Unity/UE/Blender.
+- Kết quả: `export/<id>-rigged.glb`, `data.rig_check` (passed, repaired, issues, từng phép thử), báo cáo đầy đủ `renders/qa/rig_check.json` · `next_action`: `animate`.
 
-### `animate(project_id, mesh_path=None, actions=None, method="auto")`
-- **Hoạt hóa đa action & ghép file GLB**:
-  * **Provider Mode**: Gọi Meshy Animation API (`POST /openapi/v1/animations`), tải các clip GLB độc lập và hợp nhất trong Blender bằng lệnh `export_animation_mode='ACTIONS'`.
-  * **Blender Procedural Mode**: Sinh chuyển động theo keyframe toán học trực tiếp trên 22 xương Mixamo không cần kết nối mạng:
-    - `idle`: 60 frame, nhịp thở dao động trục Z trên Hips (±1.2 cm) kèm lắc nhẹ Spine/Neck.
-    - `walk`: 40 frame, chu kỳ bước chân đối xứng và vung tay nhịp nhàng ngược pha.
-    - `wave`: 60 frame, nâng cánh tay và vẫy cẳng tay/bàn tay theo sóng sin.
-- **Tự kiểm tra nhị phân (GLB Chunk 0 Verification)**: Phân tích trực tiếp cấu trúc nhị phân của chunk 0 JSON trong file GLB xuất ra để đảm bảo số lượng track animation và tên action khớp chính xác với yêu cầu.
-- Kết quả: `export/<id>-animated.glb` chứa các animation tracks `['idle', 'walk', 'wave']`.
+### `animate(project_id, mesh_path=None, actions=None, motions=None, method="auto", secondary="auto")`
+- **Provider (Meshy)**: preset từ thư viện animation (`POST /openapi/v1/animations` với `action_ids`, 1 file nhiều clip); **Text to Motion** cho động tác riêng: `motions=[{"prompt": "xoay một vòng rồi cúi chào", "name": "bow", "duration": 4}]` → `POST /openapi/v1/text-to-motion` → `POST /openapi/v1/animations {motion_task_id}`; tất cả ghép vào một GLB. Rig đã được sửa trọng số thì trọng số đã sửa được chép sang file animation (Meshy hoạt hình hóa bản rig chưa sửa của họ).
+- **Blender procedural (offline)**: chạy trên mọi rig humanoid (tìm xương theo vai trò, xoay quanh trục giải phẫu): `idle` (thở, dồn trọng tâm), `walk`/`run` (hông nhún–lệch–xoay, gối gập pha vung, tay hạ từ A-pose và vung ngược pha), `wave`, `jump`.
+- **Chuyển động phụ** (`secondary="auto"`): tự phát hiện đuôi tóc/tóc dài và váy, thêm chuỗi xương lò xo, mô phỏng quán tính + va chạm với chân/thân rồi bake vào từng clip; chỉ giữ khi bề mặt không bị giãn thêm.
+- **Duyệt bằng mắt + chấm điểm**: mỗi clip render 6 frame từ front và side → `renders/anim/<clip>.png`; đo độ giãn bề mặt (`stretch_p99`) và độ xuyên sàn (`ground_cm`) → `data.motion_check`.
+- Kết quả: `export/<id>-animated.glb` chứa đủ các clip, tên clip được kiểm tra trực tiếp trong chunk JSON của GLB.
 
 ### `pipeline_run(project_id, max_seconds=240, rig=True, animate=False)`
 - Tự động thực thi toàn bộ chuỗi công cụ theo máy trạng thái từ đầu vào sheet ảnh 2D đến thành phẩm cuối cùng mà không cần can thiệp thủ công:
   `project_create → sheet_split → generate_mesh → score_mesh ⇄ mesh_fit → mesh_optimize → mesh_export → auto_rig → animate`.
+- Job cloud đang chạy được poll lại mỗi 5 s (tránh bị giới hạn tốc độ); cảnh báo QA của từng bước được gom vào kết quả.
+
+### Khe hở tư thế (A-pose) quan trọng ngang code
+`sheet_split` và `score_mesh` đo khe hở giữa cẳng tay/bàn tay với thân và giữa hai ống chân trên silhouette front. Tay sát thân hoặc hai đùi dính nhau là nguyên nhân chính khiến trọng số rò ("dính" khi chạy animation). Sheet dính → cảnh báo sớm. Sheet tách rời mà mesh Meshy lại dính → pipeline sinh thêm một ứng viên và ưu tiên mesh không dính.
+
+### Giới hạn còn lại
+- Chuyển động phụ là spring bone đã bake, không phải mô phỏng vải: không có nếp gấp, va chạm xấp xỉ.
+- Không có rig mặt/blendshape (mắt, miệng thường chỉ là texture), nên chưa có biểu cảm hay nhép miệng.
+- Hình học tay/đùi đã dính trên mesh thì QA chỉ phát hiện và giảm rò, không tách được.
+- Animation gắn với khung xương của rig; dùng `humanoid.json` để retarget (rig nghỉ ở A-pose).
 
 ---
 
@@ -81,6 +89,8 @@ Trong `.env`: cấu hình `CHARFORGE_LEVEL=3` để kích hoạt đầy đủ Le
 ```bash
 # Kiểm tra bộ test hợp đồng và pipeline e2e
 pytest tests/test_animate.py tests/contract/ tests/test_providers.py tests/e2e/test_pipeline_e2e.py -q
+# QA rig/animation trên nhân vật tổng hợp (cần Blender)
+pytest tests/test_rig_qa.py tests/test_anim_qa.py tests/test_pose_gaps.py -q
 ```
 
 ---
@@ -110,15 +120,17 @@ Giao cho agent lời nhắc (prompt):
 > Dùng CharForge dựng model 3D từ `assets/aria_turnaround.png`, tên `aria`, cao 165 cm. Chạy `pipeline_run(project_id='aria', rig=True, animate=True)` cho tới khi `next_action` là null, rồi báo các file output và animation tracks đã tạo.
 
 Kết quả sẽ được ghi đầy đủ vào `projects/<id>/`:
-- `views/reference.json`: Dữ liệu phân tích góc nhìn và thông số tỷ lệ
+- `views/reference.json`: Dữ liệu phân tích góc nhìn, thông số tỷ lệ và khe hở tư thế
 - `export/<id>.glb`: Model 3D tối ưu hóa lưới
-- `export/<id>-rigged.glb`: Model đã gắn armature Mixamo 22 xương
-- `export/<id>-animated.glb`: Model tích hợp sẵn các action tracks (`idle`, `walk`, `wave`)
+- `export/<id>-rigged.glb`: Model đã gắn xương (đã qua kiểm tra biến dạng, sửa trọng số nếu cần)
+- `export/<id>-humanoid.json`: Bản đồ xương để retarget
+- `export/<id>-animated.glb`: Model tích hợp sẵn các action tracks (`idle`, `walk`, `wave`, clip Text to Motion, chuỗi tóc/váy)
+- `renders/anim/<clip>.png`: Ảnh duyệt từng clip (front + side), `renders/qa/rig_check.json`: báo cáo kiểm tra rig
 
 ---
 
 ## Tài Liệu Kỹ Thuật
 
 - [ARCHITECTURE](docs/ARCHITECTURE.md): Kiến trúc hệ thống, máy trạng thái và công thức tính điểm silhouette
-- [TOOLS](docs/TOOLS.md): Quy cách chi tiết (contracts, parameters, return envelopes, error codes) của toàn bộ 10 MCP tools
+- [TOOLS](docs/TOOLS.md): Quy cách chi tiết (contracts, parameters, return envelopes, error codes) của toàn bộ 12 MCP tools
 - [ROADMAP](docs/ROADMAP.md): Lịch trình phát triển và kiểm thử qua các milestone

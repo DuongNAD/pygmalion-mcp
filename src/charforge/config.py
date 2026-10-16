@@ -37,6 +37,12 @@ REGENERATE_BELOW = 0.75  # best total under this -> new candidate instead of mes
 CANON_SIZE = 512  # canonical mask canvas, px
 PROFILE_BINS = 64  # horizontal bands in width profiles
 
+# --- pose gaps (sheet_split / score_mesh): arms and legs must be visibly apart for clean skin weights ---
+POSE_GAP_MIN = 0.012  # min gap, as a fraction of figure height, between forearm/hand and body (and between shins)
+POSE_ARM_BAND_MIN = 0.25  # share of the forearm band (55-80% of the arm length) that must show the gap
+POSE_LEG_BAND_MIN = 0.5  # share of the shin band (72-92% height) that must show two separate legs
+POSE_RETRY = 1  # extra provider candidates when the mesh fuses arms/legs the sheet keeps apart (0 = off)
+
 PROVIDER_KEYS = {"tripo": "TRIPO_API_KEY", "meshy": "MESHY_API_KEY", "rodin": "RODIN_API_KEY", "hunyuan": "FAL_KEY"}
 PROVIDER_SOURCES = {"meshy", "tripo", "rodin", "hunyuan"}
 PROVIDER_ACCEPT_TOTAL = 0.80  # min weighted silhouette total for cloud provider meshes
@@ -56,6 +62,31 @@ MESHY_ACTION_ALIASES: dict[str, list[str]] = {
     "attack": ["Attack", "Double_Combo_Attack", "Slash", "Punch"],
     "dance": ["Dancing", "Hip_Hop_Dancing", "Samba_Dancing", "Dance"],
 }
+MESHY_MOTION_MODE = "prime"  # Text to Motion: prime (10 credits, FBX) | swift (3 credits, BVH)
+MESHY_MOTION_DURATION = 4.0  # default seconds per Text to Motion clip (2-10, 0.5 steps)
+
+# --- L3 quality gates (per-project override: project.json "rig_check_thresholds" / "anim_check_thresholds") ---
+RIG_CHECK = {
+    "angle": 40.0,  # deg each upper arm (forward, up) and thigh (forward) is swung in the deformation check
+    "tol_m": 0.005,  # a vertex that must stay still "leaks" when it moves more than this (x height/1.7 m)
+    "max_ratio": 0.01,  # fail when more than 1% of a still region leaks
+    "hard_m": 0.03,  # fail when any still vertex moves more than 3 cm
+    "follow_min": 0.6,  # fail when a swung limb follows its bone less than 60% (missing weights)
+    "gap_min_m": 0.01,  # forearm/hand-body and shin-shin gap below which parts count as touching
+}
+ANIM_PREVIEW = {"frames": 6, "res": 320, "views": "front,side"}  # renders per clip for visual review
+ANIM_CHECK = {
+    "stretch_p99": 1.6,  # 99th percentile edge stretch (posed/rest) above this = visible tearing/ballooning
+    "ground_cm": 3.0,  # lowest vertex sinking below the rest ground by more than this = feet through the floor
+}
+SECONDARY = {  # spring chains baked into every clip for hanging hair and skirts (animate(secondary="auto"))
+    "stiffness": 1.2,  # pull back toward the animated rest direction (per second)
+    "drag": 0.35,  # velocity damping per frame (0..1)
+    "gravity": 0.15,  # extra sag (m/s^2 scale, rest shape already includes gravity)
+    "skirt_chains": 8,  # chains around the hips
+    "max_hair_chains": 4,
+}
+PIPELINE_POLL_SECONDS = 5.0  # pipeline_run wait between polls of a running cloud job (avoid HTTP 429)
 
 
 def home() -> Path:

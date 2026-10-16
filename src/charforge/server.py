@@ -25,7 +25,8 @@ INSTRUCTIONS = """CharForge turns a character turnaround sheet into a 3D model, 
 2. Every tool takes project_id. Lost track? Call project_status.
 3. Trust scores, not your eyes: a mesh is good only when score_mesh returns passed=true.
 4. ok=false: do exactly error.fix. The same error twice: stop and report it.
-5. Finished when next_action is null. Full procedure: prompt `charforge_playbook`."""
+5. Never write Blender code or keyframes; for a custom move use animate(motions=[...]).
+6. Finished when next_action is null; report rig_check, motion_check and the preview images. Full procedure: prompt `charforge_playbook`."""
 
 mcp = FastMCP("charforge", instructions=INSTRUCTIONS)
 
@@ -53,10 +54,12 @@ def project_create(
 @mcp.tool(annotations=READ_ONLY)
 @tool_entry
 def project_status(project_id: ProjectId) -> dict:
-    """Project state: stage, views, meshes, last scores, best mesh, outputs, call stats. Use it to resume."""
+    """Project state: stage, views, meshes, last scores, best mesh, outputs, rig/motion QA, call stats. Use it to resume."""
     p = state.load(project_id)
     data = {k: p[k] for k in ("stage", "name", "height_cm", "views", "meshes", "best", "outputs", "stop_reason")}
     data["scores"] = [{k: s.get(k) for k in ("mesh", "total", "passed", "iou")} for s in p["scores"][-5:]]
+    data["qa"] = p.get("qa") or {}
+    data["animations"] = p.get("animations") or []
     data["stats"] = state.stats(project_id)
     return ok(data, project_id, state.suggest_next(p))
 
@@ -78,7 +81,10 @@ def sheet_split(
     if res["confidence"] < 0.8:
         warnings.append("Low split confidence: open data.preview and check the numbered candidates.")
         nxt = action("sheet_split", "Confirm views from the preview.", project_id=project_id, assign=["<front>", "<side>", "<back>"])
+    pose = (res["reference"] or {}).get("pose")
+    warnings += score.pose_warnings(pose, "sheet")
     data = {k: res[k] for k in ("candidates", "boxes", "confidence", "files", "preview")}
+    data["pose"] = pose
     return ok(data, project_id, nxt, warnings)
 
 
@@ -127,6 +133,13 @@ def score_mesh(project_id: ProjectId, mesh_path: MeshPath, rotate_z: RotateZ = 0
         warnings.append(f"Provider mesh has {r['tris']} triangles (exceeds max {max_tris}); regenerate with smaller target_polycount.")
     if res.get("rotated_90") and rotate_z == 0:
         res["passed"] = False
+    else:
+        res["pose"] = score.pose_gaps(ren["front"])
+        res["pose_mismatch"] = score.pose_mismatch(p["reference"].get("pose"), res["pose"])
+        if res["pose_mismatch"]:
+            warnings.append(
+                f"Mesh fuses the {' and '.join(res['pose_mismatch'])} that the sheet keeps apart: rig weights will bleed there."
+            )
     diffs = {v: state.rel(p, f) for v, f in score.write_diffs(ref, ren, out).items()}
     next(m for m in p["meshes"] if m["path"] == rpath)["rotate_z"] = rotate_z
     state.record_score(p, {"mesh": rpath, "rotate_z": rotate_z, "tris": r["tris"], **res})

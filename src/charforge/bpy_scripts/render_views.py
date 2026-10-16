@@ -92,9 +92,15 @@ def setup(mode, res, meshes):
     if any(n.type == "TEX_IMAGE" for m in mats for n in m.node_tree.nodes):
         sh.color_type = "TEXTURE"
     elif any(len(o.data.color_attributes) for o in meshes):
-        sh.color_type = "ATTRIBUTE"
+        sh.color_type = attribute_color_type()
     else:
         sh.color_type = "MATERIAL"
+
+
+def attribute_color_type():
+    """Workbench 'Attribute' coloring is the enum item VERTEX in Blender 4.x (ATTRIBUTE in some builds)."""
+    items = {i.identifier for i in bpy.types.View3DShading.bl_rna.properties["color_type"].enum_items}
+    return "VERTEX" if "VERTEX" in items else "ATTRIBUTE"
 
 
 def render(view, lo, hi, out, mode):

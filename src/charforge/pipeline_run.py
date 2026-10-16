@@ -6,7 +6,7 @@ from typing import Annotated
 
 from pydantic import Field
 
-from . import state
+from . import config, state
 from .envelope import CFError, action, ok, tool_entry
 
 ProjectId = Annotated[str, Field(description="Id returned by project_create, e.g. 'aria'", pattern=r"^[a-z0-9][a-z0-9-]{0,47}$")]
@@ -135,28 +135,36 @@ def pipeline_run(
         elif tool_name == "mesh_export":
             summary = f"Exported files: {list(data.get('files', {}).keys())}"
         elif tool_name == "auto_rig":
+            qa = data.get("rig_check") or {}
+            qa_txt = {True: "deformation check passed", False: "deformation check FAILED", None: "deformation check skipped"}[qa.get("passed")]
+            if qa.get("repaired"):
+                qa_txt += " after weight repair"
             summary = (
                 f"Rigging in progress ({data.get('job_id')})"
                 if status_val == "running"
-                else f"Rigged model with {data.get('bones')} bones: {data.get('mesh_path')}"
+                else f"Rigged model with {data.get('bones')} bones: {data.get('mesh_path')} ({qa_txt})"
             )
         elif tool_name == "animate":
+            mc = data.get("motion_check") or {}
+            mc_txt = {True: "motion check passed", False: "motion check FAILED", None: "motion check skipped"}[mc.get("passed")]
             summary = (
                 f"Animation in progress ({data.get('job_id')})"
                 if status_val == "running"
-                else f"Animated model ({data.get('clip_count')} clips): {data.get('mesh_path')}"
+                else f"Animated model ({data.get('clip_count')} clips): {data.get('mesh_path')} ({mc_txt}; previews in renders/anim/)"
             )
         else:
             summary = f"Completed {tool_name}"
 
         steps.append({"tool": tool_name, "ok": True, "summary": summary})
+        for w in res.get("warnings") or []:
+            warnings.append(f"{tool_name}: {w}")
 
         if status_val == "running":
-            # Cloud job in progress: reload state and poll on next iteration
+            # Cloud job in progress: wait a polling interval (avoids provider rate limits), then poll again
             next_act = res.get("next_action")
             p = state.load(project_id)
             rem = max(0.0, max_seconds - (time.time() - t0))
-            time.sleep(min(0.2, rem))
+            time.sleep(min(config.PIPELINE_POLL_SECONDS, rem))
             continue
 
         # Reload state

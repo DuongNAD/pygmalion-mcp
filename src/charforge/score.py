@@ -94,6 +94,154 @@ def width_profile(canon: np.ndarray, bins: int = config.PROFILE_BINS, torso_only
     return [float(mask[a:max(b, a + 1)].any(axis=0).sum() / height) for a, b in zip(edges[:-1], edges[1:])]
 
 
+def _runs(row: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous True segments of a 1-D bool array as (start, end_exclusive)."""
+    d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+    return list(zip(np.nonzero(d == 1)[0].tolist(), np.nonzero(d == -1)[0].tolist()))
+
+
+def pose_gaps(mask: np.ndarray, gap_min: float | None = None) -> dict:
+    """A-pose readiness of a FRONT silhouette: is there background between each forearm/hand and the body,
+    and between the shins? Touching parts make auto-rigging bleed weights ("sticking" when animated).
+    Returns {"arms": {"left": part, "right": part}, "legs": part, "t_pose": bool, "ok": bool} with
+    part = {"separated": bool, "share": rows showing the gap / rows checked, "gap": median gap / figure height}.
+    left/right are the character's: the front view shows the character's left on the image right.
+    Arms: rows at 30-62% of the height; the outermost run must be arm-thin (< 12% height) with a gap after it.
+    Legs: rows at 72-92% of the height must show two runs around the centre with a gap."""
+    gap_min = config.POSE_GAP_MIN if gap_min is None else gap_min
+    c = canonical_mask(mask)
+    ys = np.nonzero(c.any(axis=1))[0]
+    if ys.size == 0:
+        none = {"separated": False, "share": 0.0, "gap": None}
+        return {"arms": {"left": dict(none), "right": dict(none)}, "legs": dict(none), "t_pose": False, "ok": False}
+    top, bottom = int(ys.min()), int(ys.max()) + 1
+    h = bottom - top
+    min_px = max(2.0, gap_min * h)
+    t_pose = arm_span_ratio(c) > 0.75  # arms held out sideways cannot touch the hips
+
+    arm_rows = range(top + int(0.30 * h), top + int(0.62 * h))
+    cx = c.shape[1] / 2.0
+    found = {"left": [], "right": []}
+    for y in arm_rows:
+        rs = _runs(c[y])
+        if len(rs) < 2:
+            continue
+        # body span: the run over the centre (torso), or the two legs around a background centre (below the crotch);
+        # only runs outside it can be arms, so thighs are never counted as arms
+        mid = next((k for k, (a, b) in enumerate(rs) if a <= cx < b), None)
+        if mid is not None:
+            lo_k = hi_k = mid
+        else:
+            hi_k = next((k for k, (a, _) in enumerate(rs) if a >= cx), len(rs))
+            lo_k = hi_k - 1
+            if lo_k < 0 or hi_k >= len(rs):
+                continue
+        if lo_k >= 1:  # image left of the body = character right
+            (a0, a1), (b0, _) = rs[lo_k - 1], rs[lo_k]
+            if a1 - a0 < 0.12 * h and b0 - a1 >= min_px:
+                found["right"].append((b0 - a1) / h)
+        if hi_k + 1 < len(rs):
+            (_, p1), (l0, l1) = rs[hi_k], rs[hi_k + 1]
+            if l1 - l0 < 0.12 * h and l0 - p1 >= min_px:
+                found["left"].append((l0 - p1) / h)
+    arms = {}
+    for side in ("left", "right"):
+        share = len(found[side]) / max(1, len(arm_rows))
+        arms[side] = {
+            "separated": bool(t_pose or share >= config.POSE_ARM_BAND_MIN),
+            "share": round(share, 3),
+            "gap": round(float(np.median(found[side])), 4) if found[side] else None,
+        }
+
+    leg_rows = range(top + int(0.72 * h), top + int(0.92 * h))
+    cx = c.shape[1] / 2.0
+    leg_gaps = []
+    for y in leg_rows:
+        rs = [r for r in _runs(c[y]) if r[1] - r[0] >= 2]
+        left_of = [r for r in rs if (r[0] + r[1]) / 2 < cx]
+        right_of = [r for r in rs if (r[0] + r[1]) / 2 >= cx]
+        if left_of and right_of:
+            g = right_of[0][0] - left_of[-1][1]
+            if g >= min_px:
+                leg_gaps.append(g / h)
+    share = len(leg_gaps) / max(1, len(leg_rows))
+    legs = {
+        "separated": bool(share >= config.POSE_LEG_BAND_MIN),
+        "share": round(share, 3),
+        "gap": round(float(np.median(leg_gaps)), 4) if leg_gaps else None,
+    }
+    return {"arms": arms, "legs": legs, "t_pose": t_pose, "ok": bool(arms["left"]["separated"] and arms["right"]["separated"] and legs["separated"])}
+
+
+def pose_mismatch(reference_pose: dict | None, mesh_pose: dict | None) -> list[str]:
+    """Parts apart in the sheet but touching in the mesh render, e.g. ["left arm"]: the generator fused them."""
+    if not reference_pose or not mesh_pose:
+        return []
+    out = []
+    for name, get in (
+        ("left arm", lambda d: ((d.get("arms") or {}).get("left") or {}).get("separated")),
+        ("right arm", lambda d: ((d.get("arms") or {}).get("right") or {}).get("separated")),
+        ("legs", lambda d: (d.get("legs") or {}).get("separated")),
+    ):
+        if get(reference_pose) is True and get(mesh_pose) is False:
+            out.append(name)
+    return out
+
+
+def pose_warnings(pose: dict | None, subject: str = "sheet") -> list[str]:
+    """Agent-facing warnings for touching parts in a front silhouette."""
+    if not pose:
+        return []
+    out = []
+    touching = [s for s in ("left", "right") if not ((pose.get("arms") or {}).get(s) or {}).get("separated", True)]
+    if touching:
+        out.append(
+            f"{subject} front view: {' and '.join(touching)} arm touches the body; rig weights will bleed there "
+            "(sticking when animated). Best fix: a sheet in A-pose with a clear gap under the arms."
+        )
+    if not (pose.get("legs") or {}).get("separated", True):
+        out.append(f"{subject} front view: legs are not apart (long skirt or legs together); thighs may stick when walking.")
+    return out
+
+
+def clip_sheet(files: dict[str, list[str]], frames: list[float], title: str, out: Path, height: int = 300) -> Path:
+    """Contact sheet of one animation clip: a labeled row per view, a column per sampled frame, on white."""
+    views = [v for v in files if files[v]]
+    pad, head = 8, 34
+    tiles: dict[str, list[np.ndarray]] = {}
+    for v in views:
+        row = []
+        for path in files[v]:
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                img = np.full((height, height, 3), 255, np.uint8)
+            elif img.ndim == 3 and img.shape[2] == 4:
+                a = img[..., 3:] / 255.0
+                img = (img[..., :3] * a + 255 * (1 - a)).astype(np.uint8)
+            row.append(cv2.resize(img, (max(1, round(img.shape[1] * height / img.shape[0])), height)))
+        tiles[v] = row
+    ncol = max((len(r) for r in tiles.values()), default=0)
+    tile_w = max((t.shape[1] for r in tiles.values() for t in r), default=height)
+    label_w = 70
+    W = label_w + ncol * (tile_w + pad) + pad
+    H = head + len(views) * (height + pad + 18) + pad
+    canvas = np.full((H, W, 3), 255, np.uint8)
+    cv2.putText(canvas, title, (pad, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 2, cv2.LINE_AA)
+    for r, v in enumerate(views):
+        y0 = head + r * (height + pad + 18)
+        cv2.putText(canvas, v, (pad, y0 + height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 60), 1, cv2.LINE_AA)
+        for k, t in enumerate(tiles[v]):
+            x0 = label_w + pad + k * (tile_w + pad)
+            canvas[y0:y0 + t.shape[0], x0:x0 + t.shape[1]] = t
+            cv2.rectangle(canvas, (x0, y0), (x0 + t.shape[1] - 1, y0 + t.shape[0] - 1), (225, 225, 225), 1)
+            if r == len(views) - 1 and k < len(frames):
+                cv2.putText(canvas, f"f{frames[k]:g}", (x0 + 4, y0 + height + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (90, 90, 90), 1, cv2.LINE_AA)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out), canvas)
+    return out
+
+
 def contact_sheet(rows: list[list[Path | str]], out: Path, height: int = 384) -> Path:
     """Grid of images (each row = one view: reference, render, diff...) on white, for visual review."""
     def tile(path):

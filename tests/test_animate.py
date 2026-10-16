@@ -336,6 +336,61 @@ def test_animate_method_provider_multi_clip_mock_transport(tmp_path, monkeypatch
     assert res["next_action"] is None
 
 
+def test_animate_provider_names_sharing_one_action_id(tmp_path, monkeypatch):
+    """['walk', 'walk', 'idle'] resolves to ids [W, W, I]; Meshy returns 2 clips (W, I): idle must get clip I."""
+    monkeypatch.setenv("CHARFORGE_LEVEL", "3")
+    monkeypatch.setenv("MESHY_API_KEY", "k")
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"dummy")
+    pid = server.project_create(sheet_path=str(sheet), name="SharedIds", height_cm=165.0)["project_id"]
+    pdir = state.project_dir(pid)
+    (pdir / "export").mkdir(exist_ok=True)
+    (pdir / f"export/{pid}-rigged.glb").write_bytes(create_synthetic_glb(["tpose"]))
+    p = state.load(pid)
+    p["outputs"]["rigged"] = f"export/{pid}-rigged.glb"
+    p["outputs"]["rig_task_id"] = "rig-1"
+    state.save(p)
+
+    gltf = {
+        "asset": {"version": "2.0"},
+        "nodes": [{"name": "Root"}],
+        "animations": [
+            {"name": "Walking", "channels": [], "samplers": [{"input": 0, "output": 1}]},
+            {"name": "Idle", "channels": [], "samplers": [{"input": 2, "output": 3}]},
+        ],
+    }
+    jb = json.dumps(gltf).encode()
+    jb += b" " * ((4 - len(jb) % 4) % 4)
+    two_clips = struct.pack("<4sII", b"glTF", 2, 20 + len(jb)) + struct.pack("<I4s", len(jb), b"JSON") + jb
+    posted = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        u = str(req.url)
+        if u.endswith("/animations/library"):
+            return httpx.Response(200, json=[{"action_id": 42, "name": "Walking", "key": "Walking"}, {"action_id": 17, "name": "Idle", "key": "Idle"}])
+        if req.method == "POST":
+            posted.append(json.loads(req.content))
+            return httpx.Response(202, json={"result": "anim-1"})
+        if u.endswith("/animations/anim-1"):
+            return httpx.Response(200, json={"status": "SUCCEEDED", "result": {"animation_glb_url": "https://cdn.mock/a.glb"}})
+        if u == "https://cdn.mock/a.glb":
+            return httpx.Response(200, content=two_clips)
+        return httpx.Response(404)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(providers, "get_provider", lambda name, client_=None, **kw: providers.MeshyProvider(api_key="k", client=client))
+    res = tools_full.animate(project_id=pid, actions=["walk", "walk", "idle"], method="provider", secondary="off")
+    assert res["ok"], res
+    assert posted[0]["action_ids"] == [42, 17]
+    out = pdir / res["data"]["mesh_path"]
+    data = out.read_bytes()
+    n = struct.unpack("<I", data[12:16])[0]
+    anims = json.loads(data[20:20 + n])["animations"]
+    assert [a["name"] for a in anims] == ["walk", "walk_01", "idle"]
+    assert [a["samplers"][0]["input"] for a in anims] == [0, 0, 2]  # idle is Meshy's Idle clip, not a second walk
+    assert [a["action_id"] for a in state.load(pid)["animations"]] == [42, 42, 17]
+
+
 # ==============================================================================
 # 5. Blender Offline Headless Mode Verification
 # ==============================================================================
