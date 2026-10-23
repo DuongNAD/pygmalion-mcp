@@ -1,9 +1,11 @@
 """Multi-action animation assembly for rigged characters. Runs INSIDE Blender: bpy/mathutils/stdlib only
-(+ the sibling cf_humanoid / cf_secondary modules).
+(+ the sibling cf_humanoid / cf_secondary / retarget modules).
 
 Modes:
-  procedural  key idle/walk/run/wave/jump (others: gentle sway) on any humanoid rig; bones are found by role and
-              rotated about anatomical world axes, so bone names and rolls do not matter.
+  procedural  one clip per --plan item on any humanoid rig: {"name", "kind"} keys idle/walk/run/wave/jump (bones found
+              by role, rotated about anatomical world axes, so bone names and rolls do not matter); {"name", "clip",
+              "loop", "trim", "action"} retargets a library clip by role (retarget.py). Without --plan each action
+              name must start with a procedural kind; any other name fails (no silent fallback).
   merge       import clip GLBs and merge their actions onto the first rig (legacy).
   rename      rename animation tracks in a GLB's JSON chunk (lossless, no Blender re-export).
   post        start from an animated GLB (--mesh): merge extra clips (--clips, named by the tail of --actions),
@@ -14,10 +16,10 @@ they do not worsen surface stretch).
 
 Protocol:
 blender -b --factory-startup --python-exit-code 1 -P merge_animations.py -- --result <json> --mesh <glb> --out <glb>
-        [--actions a,b,c] [--mode procedural|merge|rename|post] [--clips x.glb,y.glb] [--fps 30]
+        [--actions a,b,c] [--mode procedural|merge|rename|post] [--clips x.glb,y.glb] [--fps 30] [--plan <json list>]
         [--secondary auto|off] [--weights-from rigged.glb] [--stiffness 1.2] [--drag 0.35] [--gravity 0.15]
         [--skirt-chains 8] [--max-hair-chains 4]
-Result JSON: {ok, actions, clip_count, mesh_path, changed, secondary: {...}, weights: {...}}
+Result JSON: {ok, actions, clip_count, mesh_path, changed, secondary: {...}, weights: {...}, retarget: {clip: {...}}}
 """
 import argparse
 import json
@@ -35,7 +37,9 @@ from mathutils.kdtree import KDTree  # noqa: E402
 
 import cf_humanoid as hum  # noqa: E402
 import cf_secondary as sec  # noqa: E402
+import retarget as rt  # noqa: E402
 
+PROCEDURAL = ("idle", "walk", "run", "wave", "jump")
 BONE_NAMES = [
     "Hips", "Spine", "Spine1", "Spine2", "Neck", "Head",
     "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
@@ -54,6 +58,7 @@ def parse_args():
     ap.add_argument("--mode", default="procedural", choices=["procedural", "merge", "rename", "post"])
     ap.add_argument("--clips", default="")
     ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--plan", default=None)
     ap.add_argument("--secondary", default="off", choices=["auto", "off"])
     ap.add_argument("--weights-from", default=None)
     ap.add_argument("--stiffness", type=float, default=1.2)
@@ -251,11 +256,12 @@ class Animator:
             self.key_rot(f"{side}UpperArm", frame, rots)
             self.key_rot(f"{side}LowerArm", frame, [(self.X, -elbow)])
 
-    def make(self, name, fps):
+    def make(self, name, fps, kind=None):
+        kind = kind or next((k for k in PROCEDURAL if name.lower().startswith(k)), None)
+        if kind not in PROCEDURAL:
+            raise rt.ClipError(f"Unknown procedural action {name!r}.", f"Use one of: {', '.join(PROCEDURAL)}.")
         act = bpy.data.actions.new(name=name)
         assign(self.arm, act)
-        key = name.lower()
-        kind = next((k for k in ("idle", "walk", "run", "wave", "jump") if key.startswith(k)), "sway")
         getattr(self, kind)(fps)
         return act
 
@@ -344,15 +350,6 @@ class Animator:
                 self.key_rot(f"{side}UpperArm", f, [(self.Y, -ang * sign), (self.X, math.radians(30) * bend)])
                 self.key_rot(f"{side}LowerArm", f, [(self.X, -math.radians(20))])
 
-    def sway(self, fps):
-        n = int(round(2.0 * fps))
-        for f in range(0, n + 1):
-            t = 2 * math.pi * f / n
-            self.key_loc("hips", f, (0.02 * math.sin(t), 0, 0.006 * math.sin(2 * t)))
-            self.key_rot("spine", f, [(self.Y, math.radians(4) * math.sin(t))])
-            self.key_rot("head", f, [(self.Y, math.radians(-3) * math.sin(t))])
-            self.relaxed_arms(f, sway=math.radians(6) * math.sin(t), elbow=math.radians(20))
-
 
 def run_procedural(args, action_names):
     if not args.mesh or not os.path.isfile(args.mesh):
@@ -361,10 +358,23 @@ def run_procedural(args, action_names):
     bpy.ops.import_scene.gltf(filepath=args.mesh)
     arm = find_armature()
     hum.mute_animation(arm)
+    plan = json.loads(args.plan) if args.plan else [{"name": n} for n in action_names]
     anim = Animator(arm)
-    acts = [anim.make(name, args.fps) for name in action_names]
+    meshes = skinned_meshes(arm)
+    acts, clips = [], {}
+    for item in plan:
+        if item.get("clip"):
+            trim = item.get("trim")
+            act, clips[item["name"]] = rt.retarget_file(
+                item["clip"], arm, meshes, item["name"], fps=args.fps, loop=bool(item.get("loop")),
+                trim=tuple(trim) if trim else None, action=item.get("action"),
+            )
+        else:
+            act = anim.make(item["name"], args.fps, item.get("kind"))
+        act.use_fake_user = True  # unassigned between clips; keep it alive until the export
+        acts.append(act)
     hum.rest_pose(arm)
-    report = {}
+    report = {"retarget": clips} if clips else {}
     if args.secondary == "auto":
         report["secondary"] = apply_secondary(arm, skinned_meshes(arm), acts, args)
     export_glb(args.out, arm, acts)
@@ -621,7 +631,7 @@ def main():
             "ok": False,
             "code": "ANIM_FAILED",
             "message": f"{type(e).__name__}: {e}",
-            "fix": "Check mesh armature or animation clips.",
+            "fix": getattr(e, "fix", "Check mesh armature or animation clips."),
             "trace": traceback.format_exc()[-1200:],
         }
     os.makedirs(os.path.dirname(os.path.abspath(args.result)), exist_ok=True)

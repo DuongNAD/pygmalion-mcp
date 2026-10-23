@@ -44,6 +44,11 @@ ActionName = Literal["idle", "walk", "wave"]
 AnimateMethod = Literal["auto", "blender", "provider"]
 Secondary = Literal["auto", "off"]
 DEFAULT_ACTIONS = ["idle", "walk", "wave"]
+ACTIONS_HELP = (
+    "Clip names, default idle, walk, wave. Offline (method blender): procedural "
+    + ", ".join(config.PROCEDURAL_ACTIONS) + "; library clips " + ", ".join(config.MOTION_LIBRARY)
+    + ". Meshy (provider): preset names such as idle, walk, run, wave, dance."
+)
 
 
 class MotionSpec(BaseModel):
@@ -840,6 +845,56 @@ def _reusable_motion(p: dict, rig_task_id: str, spec: dict) -> dict | None:
     return None
 
 
+def _motion_key(name: str) -> str:
+    return re.sub(r"[\s-]+", "_", name.strip().lower())
+
+
+def _offline_plan(p: dict, names: list[str]) -> tuple[list[dict], dict[str, str]]:
+    """Resolve offline clip names for merge_animations.py: procedural names first, then the motion library
+    (config.MOTION_LIBRARY + project.json motion_library) by name or alias; 'walk_01' resolves like 'walk'.
+    Returns (plan, sources); an unknown name raises ANIM_FAILED listing the valid names."""
+    library = state.tunables(p, "motion_library", config.MOTION_LIBRARY)
+    alias: dict[str, str] = {}
+    for clip, spec in library.items():
+        for a in [clip, *(spec.get("aliases") or [])]:
+            alias.setdefault(_motion_key(a), clip)
+    plan, sources, unknown = [], {}, []
+    for name in names:
+        key = _motion_key(name)
+        base = re.fullmatch(r"(.+?)_\d{2}", key)
+        for k in [key] + ([base.group(1)] if base else []):
+            if k in config.PROCEDURAL_ACTIONS:
+                plan.append({"name": name, "kind": k})
+                sources[name] = "procedural"
+                break
+            if k in alias:
+                spec = library[alias[k]]
+                path = Path(spec["file"])
+                if not path.is_absolute():
+                    in_project = state.project_dir(p["id"]) / path
+                    path = in_project if in_project.is_file() else config.MOTION_DIR / path
+                if not path.is_file():
+                    raise CFError(
+                        "ANIM_FAILED",
+                        f"Motion clip file for {name!r} is missing: {path}",
+                        f"Reinstall CharForge from its repository (assets/motions), or use one of: {', '.join(config.PROCEDURAL_ACTIONS)}.",
+                    )
+                item = {"name": name, "clip": path.as_posix(), "loop": bool(spec.get("loop"))}
+                item.update({k2: spec[k2] for k2 in ("trim", "action") if spec.get(k2)})
+                plan.append(item)
+                sources[name] = f"library:{path.name}"
+                break
+        else:
+            unknown.append(name)
+    if unknown:
+        raise CFError(
+            "ANIM_FAILED",
+            f"Unknown offline action(s) {unknown}: not procedural and not in the motion library.",
+            f"Use one of: {', '.join([*config.PROCEDURAL_ACTIONS, *library])}.",
+        )
+    return plan, sources
+
+
 def _dedupe(names: list[str]) -> list[str]:
     """['walk', 'walk', 'idle'] -> ['walk', 'walk_01', 'idle'] (unique clip names)."""
     out: list[str] = []
@@ -977,7 +1032,7 @@ def _group_running(project_id: str, rpath: str, gid: str, g: dict) -> dict:
 def animate(
     project_id: ProjectId,
     mesh_path: MeshPath | None = None,
-    actions: list[str] | None = None,
+    actions: Annotated[list[str] | None, Field(description=ACTIONS_HELP)] = None,
     motions: Annotated[
         list[MotionSpec] | None,
         Field(description="Custom clips from a text prompt (Meshy Text to Motion, needs a Meshy rig), merged after the preset actions"),
@@ -986,8 +1041,9 @@ def animate(
     secondary: Annotated[Secondary, Field(description="auto = add spring motion to hanging hair and skirts when found; off = keep the rig as is")] = "auto",
     job_id: Annotated[str | None, Field(description="Previous animation job_id if status was running")] = None,
 ) -> dict:
-    """Make skeletal animation clips (Meshy presets / Text to Motion, or Blender procedural) in one GLB, then
-    render front+side frames of every clip (data.previews) and grade the motion (data.motion_check)."""
+    """Make skeletal animation clips (Meshy presets / Text to Motion, or offline: procedural clips and library clips
+    retargeted onto the rig) in one GLB, then render front+side frames of every clip (data.previews) and grade the
+    motion (data.motion_check)."""
     p = state.load(project_id)
     pdir = state.project_dir(project_id)
 
@@ -1223,7 +1279,8 @@ def animate(
                 ),
             )
 
-    # Blender procedural fallback (any humanoid rig: bones are found by role)
+    # Offline (any humanoid rig, bones found by role): procedural clips and library clips retargeted by role
+    plan, sources = _offline_plan(p, deduped_actions)
     r = blender.run(
         "merge_animations.py",
         {
@@ -1232,13 +1289,16 @@ def animate(
             "actions": ",".join(deduped_actions),
             "mode": "procedural",
             "fps": 30,
+            "plan": json.dumps(plan),
             "secondary": secondary,
             **_secondary_args(p),
         },
     )
-    p["animations"] = [{"name": a} for a in deduped_actions]
+    p["animations"] = [{"name": a, "source": sources[a]} for a in deduped_actions]
+    notes = [f"Clip {name}: {'; '.join(info['notes'])}" for name, info in ((r or {}).get("retarget") or {}).items() if info.get("notes")]
     return _finalize_animation(
-        p, pdir, project_id, rpath, out_rpath, deduped_actions, "blender", {"secondary_info": (r or {}).get("secondary")}, []
+        p, pdir, project_id, rpath, out_rpath, deduped_actions, "blender",
+        {"secondary_info": (r or {}).get("secondary"), "sources": sources}, notes,
     )
 
 

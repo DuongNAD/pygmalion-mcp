@@ -89,6 +89,26 @@ MESHY_ACTION_ALIASES: dict[str, list[str]] = {
 MESHY_MOTION_MODE = "prime"  # Text to Motion: prime (10 credits, FBX) | swift (3 credits, BVH)
 MESHY_MOTION_DURATION = 4.0  # default seconds per Text to Motion clip (2-10, 0.5 steps)
 
+# --- offline animation (animate method="blender"): procedural names first, then library clips retargeted by role ---
+PROCEDURAL_ACTIONS = ("idle", "walk", "run", "wave", "jump")  # keyed by merge_animations.Animator
+MOTION_DIR = REPO_ROOT / "assets" / "motions"  # bundled clips; sources and licenses in LICENSES.md
+# name: {file (relative to MOTION_DIR, or absolute), loop, aliases, optional trim [t0, t1] s, optional action (GLB/FBX)}.
+# Per-project additions/overrides: project.json "motion_library" (same shape).
+MOTION_LIBRARY: dict[str, dict] = {
+    "idle_relaxed": {"file": "idle_relaxed.bvh", "loop": True, "aliases": ["idle_natural", "standing_idle"]},
+    "idle_talking": {"file": "idle_talking.bvh", "loop": True, "aliases": ["talk", "talking"]},
+    "idle_arms_crossed": {"file": "idle_arms_crossed.bvh", "loop": True, "aliases": ["arms_crossed", "fold_arms", "crossed_arms"]},
+    "walk_casual": {"file": "walk_casual.bvh", "loop": True, "aliases": ["walking", "casual_walk", "walk_natural"]},
+    "jog": {"file": "jog.bvh", "loop": True, "aliases": ["jogging", "running", "run_jog"]},
+    "jump_up": {"file": "jump_up.bvh", "loop": False, "aliases": ["jumping", "jump_full", "leap"]},
+    "wave_hello": {"file": "wave_hello.bvh", "loop": False, "aliases": ["waving", "hello", "greet", "greeting"]},
+    "dance": {"file": "dance.bvh", "loop": True, "aliases": ["dancing", "groove"]},
+    "sit_down": {"file": "sit_down.bvh", "loop": False, "aliases": ["sit", "sitting", "sit_chair"]},
+    "punch": {"file": "punch.bvh", "loop": False, "aliases": ["attack", "hit", "strike", "boxing"]},
+    "bow": {"file": "bow.bvh", "loop": False, "aliases": ["bowing"]},
+    "cheer": {"file": "cheer.bvh", "loop": False, "aliases": ["cheering", "celebrate", "victory", "hooray"]},
+}
+
 # --- L3 quality gates (per-project override: project.json "rig_check_thresholds" / "anim_check_thresholds") ---
 RIG_CHECK = {
     "angle": 40.0,  # deg each upper arm (forward, up) and thigh (forward) is swung in the deformation check

@@ -13,7 +13,7 @@ Model điều phối có thể là model nhanh/rẻ (cỡ Flash), vì mọi quy�
 | Mất mạch khi pipeline dài | Trạng thái nằm trong `project.json`, tool nào cũng nhận `project_id` |
 | Gọi sai tham số | Ít tool, kiểu `Literal`/`pattern`/min-max, lỗi trả kèm `fix` |
 | Lặp vô hạn | Ngân sách `MAX_ITERATIONS=8`, dừng khi plateau, vẫn xuất best |
-| Tự viết keyframe animation (dính, giật) | Không có tool keyframe; preset Meshy, `animate(motions=[…])` (Text to Motion) hoặc procedural có sẵn |
+| Tự viết keyframe animation (dính, giật) | Không có tool keyframe; preset Meshy, `animate(motions=[…])` (Text to Motion), procedural có sẵn hoặc clip thư viện `assets/motions/` (retarget theo vai trò xương) |
 | Không biết rig có "dính" không | `auto_rig` tự vung tay/đùi đo rò trọng số, tự sửa; `animate` render frame từng clip + đo độ giãn bề mặt |
 
 ## 2. Chọn framework
@@ -50,8 +50,8 @@ Cổng chất lượng của L3 (không thêm tool, nằm trong auto_rig/animate
 ## 4. Mô hình tiến trình
 - **MCP server**: Python 3.11, stdio, tool đồng bộ. `server.py` chỉ điều phối; logic nằm trong `state.py` (policy), `sheet.py`, `score.py`, `blender.py`.
 - **Blender**: mỗi lệnh là một subprocess `blender -b --factory-startup --python-exit-code 1 -P bpy_scripts/<x>.py -- --result <json> --key value…`. Script trong `bpy_scripts/` chạy bằng Python của Blender nên **chỉ import bpy/mathutils/stdlib**, không import `charforge`. Kết quả trả qua file `--result`: `{"ok": true, …}` hoặc `{"ok": false, "code", "message", "fix"}`. Không parse stdout.
-  - Hai module dùng chung nằm cùng thư mục và được import bằng `sys.path.insert(0, dirname(__file__))`: `cf_humanoid.py` (nhận diện vai trò xương theo cấu trúc, phân vùng đỉnh theo đoạn xương, phép thử biến dạng, đo tiếp xúc, sửa trọng số, bản đồ humanoid) và `cf_secondary.py` (phát hiện tóc/váy, chuỗi spring bone, mô phỏng và bake). Chúng cũng chỉ dùng bpy/mathutils/stdlib.
-  - Script L3: `rig.py` (rig offline + QA chỉ báo cáo), `rig_check.py` (QA + sửa cho rig bất kỳ), `merge_animations.py` (procedural / merge / rename / post), `preview_clips.py` (render frame từng clip + chỉ số chuyển động).
+  - Ba module dùng chung nằm cùng thư mục và được import bằng `sys.path.insert(0, dirname(__file__))`: `cf_humanoid.py` (nhận diện vai trò xương theo cấu trúc hoặc theo tên, phân vùng đỉnh theo đoạn xương, phép thử biến dạng, đo tiếp xúc, sửa trọng số, bản đồ humanoid), `cf_secondary.py` (phát hiện tóc/váy, chuỗi spring bone, mô phỏng và bake) và `retarget.py` (gắn clip BVH/GLB/FBX lên rig theo vai trò xương). Chúng cũng chỉ dùng bpy/mathutils/stdlib.
+  - Script L3: `rig.py` (rig offline + QA chỉ báo cáo), `rig_check.py` (QA + sửa cho rig bất kỳ), `merge_animations.py` (procedural và clip thư viện / merge / rename / post), `preview_clips.py` (render frame từng clip + chỉ số chuyển động).
 - **Provider (L2/L3)**: gọi HTTP bằng `httpx` (đi kèm `mcp`). Job dài (`generate_mesh`, `auto_rig`, `animate`) không block quá ~55 s mà trả `status: "running"` + `job_id`, lưu job kèm `kind` bền vững (`multi-image-to-3d` / `image-to-3d` / `rigging` / `animations`) vào `project.json.jobs` để gọi lại ở lượt sau mà không phụ thuộc bộ nhớ tiến trình.
 
 ## 5. Dữ liệu
@@ -82,7 +82,8 @@ Các trường của `project.json` (schema_version 1):
 | `jobs` | job provider đang chạy: `{job_id: {provider, kind, started_at, ...}}`; `kind="animate-group"` gom preset + Text to Motion (`parts`) |
 | `outputs` | `{optimized, glb, fbx, rigged, rigged_provider, rig_repaired, humanoid, animated, previews, rig_task_id, basic_animations}` |
 | `qa` | `{rig: tóm tắt rig_check, motion: tóm tắt motion_check}` |
-| `animations` | `[{name, action_id? \| prompt + motion_task_id}]` |
+| `animations` | `[{name, action_id? \| prompt + motion_task_id \| source: procedural / library:<file>}]` |
+| `motion_library` | (tùy chọn) thêm hoặc ghi đè clip của `config.MOTION_LIBRARY` cho riêng project |
 | `stop_reason` | `null` / `budget` / `plateau` |
 
 ## 6. Policy: stage → next_action (`state.suggest_next`)
@@ -130,7 +131,11 @@ Z-up, đơn vị mét, nhân vật nhìn về −Y (mặc định khi Blender im
 - Không có rig mặt hay blendshape: mesh sinh ra thường vẽ mắt/miệng lên texture, không có hình học để tạo biểu cảm hay nhép miệng. Cần mesh có mặt mô hình hóa riêng hoặc làm tay.
 - Tay sát thân hoặc hai đùi dính nhau trên mesh vẫn làm rò trọng số ở chỗ tiếp xúc; QA phát hiện, sửa phần rò "xa" và báo vùng tiếp xúc, nhưng không tách được hình học đã dính. Sheet A-pose có khe hở rõ dưới nách và giữa hai chân quan trọng ngang code (đã cảnh báo từ `sheet_split`).
 - Animation gắn với khung xương của rig (Meshy hoặc rig offline). `export/<id>-humanoid.json` cho bản đồ vai trò → tên xương (kèm tên Mixamo) để retarget trong Unity/UE/Blender; tư thế nghỉ là A-pose nên công cụ retarget phải bù khác biệt với clip T-pose.
-- Nhánh offline (Blender procedural) đã tách khỏi tên xương và có dáng đi đầy đủ pha, nhưng vẫn là keyframe công thức: kém tự nhiên hơn thư viện preset hay Text to Motion của Meshy.
+- Nhánh offline có hai nguồn. Procedural đã tách khỏi tên xương, nhưng vẫn là keyframe công thức. Thư viện clip `assets/motions/` có 12 clip keyframe tay của Quaternius và KayKit (CC0), gắn lên rig theo vai trò xương nên tự nhiên hơn. Giới hạn của thư viện:
+  - Chỉ có 12 động tác. Không có IK khóa chân, nên chân có thể trượt nhẹ khi tỉ lệ chân khác clip nhiều.
+  - Clip từ nhân vật chibi (KayKit: `jump_up`, `cheer`) giữ dáng điệu chibi (gối hơi khuỵu).
+  - Tay có thể xuyên thân trên nhân vật thân to hơn nhân vật nguồn.
+  - Clip chạy (`jog`) gập gối sâu. Trên nhân vật thử của test, `stretch_p99` là 1,66, vượt nhẹ ngưỡng 1,6.
 - Điểm silhouette không đánh giá được mặt và biểu cảm. Phần này do critic thị giác (5d) chấm, nếu được bật.
 - Critic thị giác là một model, không phải phép đo: điểm có thể dao động giữa các lần gọi. Vì vậy nó chỉ tư vấn và chỉ quyết định khi chênh rõ (≥ 1 điểm).
 - Ảnh có watermark của tác giả (ví dụ @higgs.osiris). Muốn dùng thương mại thì cần xin phép. Ảnh sẽ được gửi lên provider cloud khi dùng L2, và lên Gemini API hoặc Claude API khi bật critic.

@@ -21,6 +21,9 @@ You orchestrate tools. You never write Blender code, never write animation keyfr
 7. `auto_rig` checks how the rig deforms (`data.rig_check`) and repairs weight leaks itself. `passed=false` after repair: do not retry, report the issues (usually arms touching the body in the sheet or mesh).
 8. `animate` returns `data.previews` (front+side frames per clip) and `data.motion_check`. Report failed clips; never try to fix motion by hand.
    Custom move: `animate(project_id, motions=[{"prompt": "...", "name": "...", "duration": 4}])` (needs a Meshy rig).
+   Offline (no Meshy): name `actions` from the procedural set (idle, walk, run, wave, jump) or the clip library
+   (idle_relaxed, idle_talking, idle_arms_crossed, walk_casual, jog, jump_up, wave_hello, dance, sit_down, punch, bow, cheer).
+   `ANIM_FAILED` for an unknown name: pick names from `error.fix` and call again.
 9. Done when `next_action` is null. Final report: output files (rigged and animated GLBs, humanoid map, preview images), best total, passed, stop_reason, rig_check and motion_check results, stats from `project_status`.
 
 Level 3 shortcut: `pipeline_run(project_id, rig=True, animate=True)` runs steps 2-8 itself. Call it again while `data.status == "running"`.
