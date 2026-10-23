@@ -209,7 +209,8 @@ class TestCustomActionSets:
         assert set(extracted) == set(actions)
 
     def test_all_custom_action_names(self, tmp_path, monkeypatch):
-        """Verify arbitrary action names ['action1', 'action2', 'action3', 'action4'] export cleanly."""
+        """Arbitrary names ['action1', ..., 'action4'] are neither procedural nor library clips: animate fails with
+        ANIM_FAILED listing the valid names (they used to become a silent sway, card G3-3)."""
         monkeypatch.setenv("CHARFORGE_LEVEL", "3")
         sheet = tmp_path / "sheet.png"
         sheet.write_bytes(b"dummy")
@@ -228,14 +229,11 @@ class TestCustomActionSets:
 
         custom_actions = ["action1", "action2", "action3", "action4"]
         res = tools_full.animate(project_id=pid, actions=custom_actions, method="blender")
-        assert res["ok"] is True
-        assert res["data"]["actions"] == custom_actions
-        assert res["data"]["clip_count"] == 4
-
-        out_glb = pdir / res["data"]["mesh_path"]
-        extracted = inspect_glb_animations(out_glb)
-        assert len(extracted) == 4
-        assert set(extracted) == set(custom_actions)
+        assert res["ok"] is False
+        assert res["error"]["code"] == "ANIM_FAILED"
+        assert all(a in res["error"]["message"] for a in custom_actions)
+        assert res["error"]["fix"].startswith("Use one of: idle, walk, run, wave, jump, ")
+        assert not (pdir / f"export/{pid}-animated.glb").exists()
 
     def test_empty_and_none_actions_fallback(self, tmp_path, monkeypatch):
         """Verify None and empty list fallback to default ['idle', 'walk', 'wave']."""
