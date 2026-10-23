@@ -32,6 +32,7 @@ charforge = ["bpy_scripts/*.py", "playbook.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]  # test this checkout's code, not the editable install (which may point at another worktree)
 markers = [
   "blender: needs a local Blender install (auto-skipped otherwise)",
   "live: calls live external cloud APIs (requires MESHY_API_KEY and CHARFORGE_LIVE=1)",
