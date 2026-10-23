@@ -60,6 +60,30 @@ def assert_alternates(lead):
     assert flips >= 2, f"feet do not alternate: {flips} sign change(s)"
 
 
+def turned_bvh(src, out):
+    """The same clip turned 180 deg about the vertical: it faces away (-Z in BVH, +Y in Blender), bone names unchanged.
+    Exact: offsets and root position (x, y, z) -> (-x, y, -z); each Z X Y rotation triplet (z, x, y) -> (-z, -x, y)."""
+    lines, motion, data = [], False, False
+    for ln in src.read_text(encoding="ascii").splitlines():
+        s = ln.split()
+        if not motion and s and s[0] == "OFFSET":
+            lines.append(ln[: len(ln) - len(ln.lstrip())] + f"OFFSET {-float(s[1]):.4f} {s[2]} {-float(s[3]):.4f}")
+            continue
+        if s and s[0] == "MOTION":
+            motion = True
+        if data and s:
+            v = [float(x) for x in s]
+            v[0], v[2] = -v[0], -v[2]
+            for i in range(3, len(v), 3):
+                v[i], v[i + 1] = -v[i], -v[i + 1]
+            ln = " ".join(f"{x:.4f}" for x in v)
+        if s[:2] == ["Frame", "Time:"]:
+            data = True
+        lines.append(ln)
+    out.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return out
+
+
 def rigged_project(sheet_path, monkeypatch, name, rig_file):
     monkeypatch.setenv("CHARFORGE_LEVEL", "3")
     monkeypatch.delenv("MESHY_API_KEY", raising=False)
@@ -174,6 +198,25 @@ def test_every_library_clip_retargets(chars, sheet_path, monkeypatch):
     for name, m in clips.items():
         assert m["ground_cm"] <= config.ANIM_CHECK["ground_cm"], (name, m)
         assert m["stretch_p99"] < 1.8, (name, m)  # a flipped or mis-aligned bone tears the mesh far beyond this
+
+
+@needs_blender
+def test_clip_facing_away_plays_the_same(chars, sheet_path, monkeypatch, tmp_path):
+    # structure alone would swap left and right on a clip facing +Y; bone names and the facing alignment undo it
+    pid, pdir = rigged_project(sheet_path, monkeypatch, "TurnedClip", chars / "opaque.glb")
+    turned_bvh(config.MOTION_DIR / "walk_casual.bvh", pdir / "walk_turned.bvh")
+    p = state.load(pid)
+    p["motion_library"] = {"walk_turned": {"file": "walk_turned.bvh", "loop": True}}
+    state.save(p)
+    res = tools_full.animate(project_id=pid, actions=["walk_casual", "walk_turned"], method="blender", secondary="off")
+    assert res["ok"], res
+    assert res["data"]["sources"]["walk_turned"] == "library:walk_turned.bvh"
+    assert any("walk_turned" in w and "sides taken from bone names" in w for w in res["warnings"]), res["warnings"]
+    glb = pdir / res["data"]["mesh_path"]
+    ref, turned = foot_lead(glb, "walk_casual", tmp_path), foot_lead(glb, "walk_turned", tmp_path)
+    assert len(ref) == len(turned)
+    assert max(abs(a - b) for a, b in zip(ref, turned)) < 0.01
+    assert res["data"]["motion_check"]["passed"] is True
 
 
 @needs_blender
