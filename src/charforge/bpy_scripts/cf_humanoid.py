@@ -390,6 +390,45 @@ def map_roles(arm):
     }
 
 
+def map_roles_by_name(arm):
+    """Humanoid roles from bone names alone (Mixamo, CMU BVH, UE, 3ds Max Biped styles), for skeletons whose structure
+    is ambiguous, e.g. a motion clip that does not face -Y. The bone nearest the root wins each role.
+    Returns the same dict shape as map_roles."""
+    B = _tables(arm)
+    order, queue = [], [n for n, d in B.items() if d["parent"] is None]
+    while queue:
+        n = queue.pop(0)
+        order.append(n)
+        queue.extend(B[n]["children"])
+    roles, torso = {}, []
+    for n in order:
+        kind = name_kind(n)
+        if kind in (None, "end", "finger"):
+            continue
+        if kind == "spine":
+            torso.append(n)
+        elif kind in ("hips", "neck", "head"):
+            roles.setdefault(kind, n)
+        elif name_side(n):
+            roles.setdefault(name_side(n) + kind[0].upper() + kind[1:], n)
+    if torso:
+        roles["spine"] = torso[0]
+        if len(torso) >= 3:
+            roles["chest"], roles["upperChest"] = torso[-2], torso[-1]
+        elif len(torso) == 2:
+            roles["chest"] = torso[1]
+    pts = [p for d in B.values() for p in (d["head"], d["tail"])]
+    core = ("hips", "leftUpperArm", "rightUpperArm", "leftUpperLeg", "rightUpperLeg", "head")
+    return {
+        "ok": all(r in roles for r in core),
+        "roles": roles,
+        "missing": [r for r in ROLES if r not in roles],
+        "notes": [],
+        "height_m": round(max(p.z for p in pts) - min(p.z for p in pts), 4) if pts else 0.0,
+        "source": "names",
+    }
+
+
 def bone_roles(arm, roles):
     """bone -> role of its nearest mapped ancestor-or-self (fingers -> hand, toe ends -> toes, hair -> head)."""
     B = _tables(arm)
